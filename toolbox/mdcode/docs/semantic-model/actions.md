@@ -789,7 +789,7 @@ runs it, so reading the listing is enough to make the call:
 
 ```
 Model 'payments' (payments_eg), profile 'operational':
-  store: sqlgen-testing/graph-unified-solution-demo/semantic_agent_demo
+  store: my-project/my-instance/semantic_agent_demo
   TransferFunds: Move money from one account to another.
     parameters: source (Account, reference), target (Account, reference), amount (Float)
     executor:   sql
@@ -955,7 +955,7 @@ changes nothing.
 
 ```
 Model 'payments' (payments_eg), profile 'operational':
-  store: sqlgen-testing/graph-unified-solution-demo/semantic_agent_demo
+  store: my-project/my-instance/semantic_agent_demo
 
   action  transfer_funds  (TransferFunds)  [NOT RUNNABLE]
       Move money from one account to another.
@@ -1197,6 +1197,16 @@ drifting in each one.
 
 So an agent that appends a persona of its own is saying something the model did
 not. The place to put it is the model.
+
+### A worked example
+
+`demo/semantic-model/agent/` is an agent built this way, running against a live
+operational store: a commerce model, a binding profile, and one file of 56 lines
+that names no table, no column and no business term. Thirteen of those lines are
+the adapter onto the agent framework. Its README walks the same four steps and
+states what the run cannot yet do — the $30 credit it issues is over the model's
+declared $25 self-service ceiling and is written anyway, because nothing
+evaluates constraints.
 
 ## What is not modeled yet
 
