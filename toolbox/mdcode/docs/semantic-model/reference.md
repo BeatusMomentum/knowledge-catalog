@@ -70,17 +70,44 @@ kcmd action list
 kcmd action run <name> --arg <name>=<value> ...
 ```
 
-`list` prints every action the models in the scope declare, with the command
-line that runs each one. `run` executes one against the Spanner database the
-selected profile's deployment target names; only a `sql` executor runs, and an
-action that names a constraint in `guards` is refused rather than run
-unchecked, because nothing evaluates a constraint yet. See
-[Run it](actions.md#7-run-it).
+`list` prints every action the models in the scope declare, with the store a run
+would reach and the command line that runs each one. `run` executes one against
+the Spanner database the selected profile's deployment target names; only a
+`sql` executor runs, and an action that names a constraint in `guards` is
+refused rather than run unchecked, because nothing evaluates a constraint yet.
+See [Run it](actions.md#7-run-it).
 
 | Flag | Effect |
 |------|--------|
 | `--arg <name>=<value>` | Bind one action parameter. Repeat the flag for each one; the value is text, parsed against the parameter's declared ontology type. `run` only. |
 | `--profile [name]` | Read the model under this binding profile. Its deployment target names the database the action runs against, so this is how you change stores. Defaults to `default_profile`, else the model's inline bindings. |
+| `--store` | Print only where a run would land, on one line and nothing else, for a script to read rather than parse back out of the listing: `project/instance/database` for a Spanner store, `bigquery:project/dataset` for a BigQuery one. Errors when the scope holds more than one model, since those may name different databases. `list` only. |
+
+### agent
+
+```bash
+kcmd agent tools
+```
+
+Prints what an agent would be handed for the models in the scope: one lookup
+tool per entity, and one tool per action. Each carries its description, the
+calling guidance the model wrote, and one line per parameter giving that field's
+own description. Reading the model is all this does — it touches no store and
+runs nothing.
+
+A tool the runtime cannot call is listed and marked `[NOT RUNNABLE]` rather than
+dropped, with the reason in its description, so a refusal is visible before any
+agent exists. To see what a guard costs today, add a constraint to an action's
+`guards` and run this again.
+
+A model whose profile names no Spanner database offers no tools, because calling
+one needs a store. That model is reported as offering none and the rest of the
+scope is still listed; the command exits non-zero. See
+[Hand it to an agent](actions.md#8-hand-it-to-an-agent).
+
+| Flag | Effect |
+|------|--------|
+| `--profile [name]` | Read the model under this binding profile. Defaults to `default_profile`, else the model's inline bindings. |
 
 ## What gets created in BigQuery
 

@@ -11,9 +11,41 @@
 
 import {describe, expect, test} from 'bun:test';
 
-import * as spanner from '../../../src/libts/gcp/spanner';
-import {Action, Constraint, SemanticModel} from '../../../src/libts/semantic/ir';
-import {ActionPlan, runAction} from '../../../src/libts/semantic/runtime';
+import * as spanner from '../../../../src/libts/gcp/spanner';
+import {Action, Constraint, SemanticModel} from '../../../../src/libts/semantic/ir';
+import {SemanticRuntime} from '../../../../src/libts/semantic/runtime/runtime';
+import {ActionPlan, runAction, RunActionOptions} from '../../../../src/libts/semantic/runtime/run_action';
+
+
+// `runAction` takes a runtime: a model paired with the store it runs against.
+// What these tests vary is those two independently -- this model against that
+// fake store -- so they go on naming them separately and are paired here.
+// Whether the pairing itself is right is `store.test.ts`'s question.
+type ActArgs = Omit<RunActionOptions, 'runtime'>&
+    {model: SemanticModel; client: spanner.SpannerDataClient};
+
+function rt(model: SemanticModel, client: spanner.SpannerDataClient):
+    SemanticRuntime {
+  return {
+    model,
+    document: 'test',
+    store: {
+      kind: 'spanner',
+      name: 'projects/p/instances/i/databases/d',
+      project: 'p',
+      instance: 'i',
+      database: 'd',
+      client,
+    },
+    profile: 'default',
+    entryGroup: 'eg',
+  };
+}
+
+function act(o: ActArgs) {
+  const {model, client, ...rest} = o;
+  return runAction({runtime: rt(model, client), ...rest});
+}
 
 
 // A query the fake knows how to answer: rows returned when `match` is found in
@@ -166,8 +198,8 @@ function resolvingFake(extra: Answer[] = []) {
 }
 
 function run(
-    fake: FakeSpanner, over: Partial<Parameters<typeof runAction>[0]> = {}) {
-  return runAction({
+    fake: FakeSpanner, over: Partial<ActArgs> = {}) {
+  return act({
     model: model(),
     actionName: 'Transfer',
     args: {source: 'A1', target: 'A2', amount: 100},
@@ -534,8 +566,8 @@ function creditModel(overrides: Partial<SemanticModel> = {}): SemanticModel {
 }
 
 function runCredit(
-    fake: FakeSpanner, over: Partial<Parameters<typeof runAction>[0]> = {}) {
-  return runAction({
+    fake: FakeSpanner, over: Partial<ActArgs> = {}) {
+  return act({
     model: creditModel(),
     actionName: 'Credit',
     args: {account: 'A1', amount: 100},
@@ -620,7 +652,7 @@ describe('a guarded action is refused, not run unchecked', () => {
   };
 
   const runWith = (over: Partial<SemanticModel>, fake = resolvingFake()) =>
-      runAction({
+      act({
         model: creditModel(over),
         actionName: 'Credit',
         args: {account: 'A1', amount: 100},
@@ -896,7 +928,7 @@ describe('a constraint that only warns', () => {
   };
 
   test('does not gate the action that guards it', async () => {
-    const outcome = await runAction({
+    const outcome = await act({
       model: creditModel({
         actions: [{...credit, guards: ['BalanceIsLow']}],
         constraints: [advisory],
@@ -915,7 +947,7 @@ describe('a constraint that only warns', () => {
         // validation -- but a library caller reaching runAction directly gets
         // no such pass, and a guard this cannot account for is not something
         // to wave through on the grounds that it was not found.
-        const outcome = await runAction({
+        const outcome = await act({
           model: creditModel({
             actions: [{...credit, guards: ['NoSuchRule']}],
             constraints: [advisory],
@@ -989,7 +1021,7 @@ describe('a date or a timestamp argument', () => {
     const fake = resolvingFake();
     return {
       fake,
-      outcome: runAction({
+      outcome: act({
         model: model({actions: [schedule]}),
         actionName: 'Schedule',
         args: {
@@ -1084,7 +1116,7 @@ describe('an argument given as empty text', () => {
     // `--arg memo=` says the memo is blank, which is a different statement
     // from not passing one.
     const fake = resolvingFake();
-    const outcome = await runAction({
+    const outcome = await act({
       model: creditModel({
         actions: [{
           ...credit,
@@ -1120,7 +1152,7 @@ describe('an argument given as empty text', () => {
          // command line. A String parameter is not being parsed -- it IS the
          // value -- so trimming it would store text the caller did not write.
          const fake = resolvingFake();
-         const outcome = await runAction({
+         const outcome = await act({
            model: creditModel({
              actions: [{
                ...credit,
@@ -1158,5 +1190,36 @@ describe('an argument given as empty text', () => {
         await runCredit(resolvingFake(), {args: {account: 'A1', amount: ''}});
     if (outcome.status !== 'error') throw new Error('expected an error');
     expect(outcome.message).toContain('was not given a value');
+  });
+});
+
+
+// The write side reads a binding the same way the read side does. A key field
+// carrying only its imported vendor expression still names a real column, so
+// resolving a reference against it is a lookup rather than a refusal.
+describe('an entity key that awaits transpilation', () => {
+  test('resolves against the imported column', async () => {
+    const fake = new FakeSpanner([{match: 'FROM Account', rows: [['1']]}]);
+    const outcome = await run(fake, {
+      model: model({
+        entities: [{
+          name: 'Account',
+          dataSource: 'demo.payments.Account',
+          keys: ['accountId'],
+          fields: [
+            {
+              name: 'accountId',
+              importedExpression: 'account_id',
+              importedDialect: 'SNOWFLAKE',
+              type: 'String',
+            },
+          ],
+        }],
+      }),
+    });
+    expect(fake.statements[0].sql).toContain('account_id = @ref0');
+    if (outcome.status === 'error') {
+      throw new Error(`expected a resolved reference: ${outcome.message}`);
+    }
   });
 });

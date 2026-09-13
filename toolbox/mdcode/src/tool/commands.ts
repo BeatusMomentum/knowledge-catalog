@@ -8,26 +8,27 @@ import * as kcmd from '../libts';
 import {BigQueryClient} from '../libts/gcp/bigquery';
 import * as context from '../libts/gcp/context';
 import * as dataplex from '../libts/gcp/dataplex';
-import {SpannerDataClient} from '../libts/gcp/spanner';
 import {SemanticModelLayout} from '../libts/layouts/semantic-model';
 import {convertOwlToOsi} from '../libts/semantic/converters/owl/convert';
 import * as deploy from '../libts/semantic/deploy_bigquery';
 import * as kc from '../libts/semantic/deploy_knowledge_catalog';
 import * as deploySpannerLeg from '../libts/semantic/deploy_spanner';
 import {googleDeploymentTargets} from '../libts/semantic/deployment_target';
-import {Action, ActionParameter, SemanticModel} from '../libts/semantic/ir';
+import {ActionTool, EntityTool, modelTools} from '../libts/semantic/runtime/agent_tools';
+import {Action, ActionParameter} from '../libts/semantic/ir';
 import {provisionCustomTypes} from '../libts/semantic/kc_custom_types';
 import {LoadedModel, loadSemanticModels} from '../libts/semantic/loader';
 import {serializeModel} from '../libts/semantic/osi_converter';
 import {pullKnowledgeCatalog} from '../libts/semantic/pull_kc';
-import {resolveInheritance} from '../libts/semantic/resolve_inheritance';
-import {runAction} from '../libts/semantic/runtime';
+import {runAction} from '../libts/semantic/runtime/run_action';
 import {transpileModels} from '../libts/semantic/transpile';
 import {validateBigQueryDataSources, validatePushRequirements, validateRunnable} from '../libts/semantic/validate';
+import {createSemanticRuntimes, runtimeClient, SemanticRuntime} from '../libts/semantic/runtime/runtime';
+import {spannerClientFor, Store} from '../libts/semantic/runtime/store';
 import {
   AvailabilityReport,
   DEFAULT_PROFILE,
-  mergeProfile,
+  mergeProfileOntoDoc,
   pruneUnavailable,
 } from '../libts/semantic/resolve_profiles';
 import {Sources} from '../libts/source';
@@ -294,31 +295,6 @@ export async function pull(options: PullOptions = {}): Promise<number> {
     console.error('Error pulling catalog entries:', result.details);
     return 1;
   }
-}
-
-
-// Parses a logical model document and a binding profile document, merges the
-// profile onto the model by name, and returns the merged authoring text plus any
-// merge warnings. Shared by `push` and `profiles` so the two paths parse, merge,
-// warn, and fail identically; on a parse error or a binding-contract violation
-// it returns `error` for the caller to surface.
-function mergeProfileOntoDoc(
-    logicalText: string, profileText: string,
-    profileName: string): {text: string; warnings: string[]}|{error: string} {
-  let logicalDoc: unknown;
-  let profileDoc: unknown;
-  try {
-    logicalDoc = yaml.parse(logicalText);
-    profileDoc = yaml.parse(profileText);
-  } catch (err: any) {
-    return {
-      error: `could not parse the model or profile '${profileName}': ${
-          err?.message ?? err}`,
-    };
-  }
-  const merged = mergeProfile(logicalDoc, profileDoc, profileName);
-  if (merged.error) return {error: merged.error};
-  return {text: yaml.stringify(merged.doc), warnings: merged.warnings};
 }
 
 
@@ -1193,6 +1169,8 @@ export interface ActionOptions {
   // `string|boolean` for the same reason push's is: cac yields `true` for a
   // bare `--profile` and `false` for `--no-profile`.
   profile?: string|boolean;
+  // `--store`: print where a run would land and nothing else (`list` only).
+  store?: boolean;
 }
 
 
@@ -1218,89 +1196,20 @@ export async function action(
   }
 
   const ctx = context.ApiContext.default();
-  const snapshot = await kcmd.CatalogSnapshot.fromPath('.', ctx);
-  if (snapshot.manifest.source.type !== Sources.SEMANTIC_MODEL) {
-    console.error(
-        'Error: `kcmd action` applies only to a semantic-model scope.');
-    return 1;
-  }
-  const layout = snapshot.layout as SemanticModelLayout;
-  const source = snapshot.manifest.source as SemanticModelSource;
   // cac hands back `true` for a bare `--profile` and mri `false` for
   // `--no-profile`; neither names a profile, and `??` would let both through
   // to be looked up as one. Same guard push uses.
   const named =
       typeof options.profile === 'string' ? options.profile : undefined;
-  const profile =
-      named ?? snapshot.manifest.defaultProfile ?? DEFAULT_PROFILE;
 
-  const loaded = loadForProfile(layout, source, ctx, profile);
-  if ('error' in loaded) {
-    console.error(`Error: ${loaded.error}`);
+  const opened = await createSemanticRuntimes({profile: named, ctx});
+  if ('error' in opened) {
+    console.error(`Error: ${opened.error}`);
     return 1;
   }
 
-  return command === 'list' ?
-      listActions(loaded.models, source.entryGroup, profile) :
-      await runOneAction(loaded.models, ctx, name, options);
-}
-
-
-// Loads every model document in the scope under one binding profile. A lighter
-// path than push's: nothing is transpiled, pruned or validated for deployment,
-// because running an action needs the model as authored rather than the subset
-// a deployed graph can answer. Bindings stay optional so `list` works on a
-// purely logical model; a `run` that needs a source the model does not bind
-// fails in the runtime, which names the entity.
-function loadForProfile(
-    layout: SemanticModelLayout, source: SemanticModelSource,
-    ctx: context.ApiContext,
-    profile: string): {models: LoadedModel[]}|{error: string} {
-  const docs = layout.modelDocuments();
-  if (!docs.length) return {error: 'no semantic model documents found.'};
-
-  const merged: Array<{name: string; text: string}> = [];
-  for (const doc of docs) {
-    if (profile === DEFAULT_PROFILE) {
-      merged.push({name: doc.name, text: doc.text});
-      continue;
-    }
-    const available = layout.profileDocuments(doc.name);
-    const chosen = available.find(p => p.name === profile);
-    if (!chosen) {
-      const names = available.map(p => p.name);
-      return {
-        error: `unknown binding profile '${profile}' for model '${doc.name}'; ` +
-            (names.length ? `defined profiles: ${names.join(', ')}.` :
-                            `no profiles are defined for this model.`),
-      };
-    }
-    const res = mergeProfileOntoDoc(doc.text, chosen.text, profile);
-    if ('error' in res) return {error: `[${doc.name}] ${res.error}`};
-    for (const w of res.warnings) console.warn(`Warning: [${doc.name}] ${w}`);
-    merged.push({name: doc.name, text: res.text});
-  }
-
-  const loaded = loadSemanticModels(
-      merged,
-      {defaultProject: source.project ?? ctx.project, bindingOptional: true});
-  if (loaded.error) return {error: loaded.error};
-  for (const w of loaded.warnings) console.warn(`Warning: ${w}`);
-
-  // Inheritance is resolved for the same reason both push legs resolve it: an
-  // inherited field is a field, and every reader downstream reads
-  // `entity.fields`. The runtime is the reader where skipping it is unsafe
-  // rather than merely incomplete. It would not see a subtype's inherited
-  // `name`, so resolving a reference by name would report a row missing that
-  // is there; and it would not see an inherited key's TYPE, so the check that
-  // refuses a generated UUID for an Integer key would read the key as a
-  // String, pass, and let the store take the mismatch instead.
-  const models = loaded.models.map(m => {
-    const resolved = resolveInheritance(m.model);
-    for (const w of resolved.warnings) console.warn(`Warning: ${w}`);
-    return {...m, model: resolved.model};
-  });
-  return {models};
+  return command === 'list' ? listActions(opened, options) :
+                              await runOneAction(opened, ctx, name, options);
 }
 
 
@@ -1308,9 +1217,44 @@ function loadForProfile(
 // the command that runs it, filled in with the declared parameters, so reading
 // the listing is enough to make the call without going back to the YAML.
 function listActions(
-    models: LoadedModel[], entryGroup: string, profile: string): number {
-  for (const {model} of models) {
-    console.log(`Model '${model.name}' (${entryGroup}), profile '${profile}':`);
+    runtimes: SemanticRuntime[], options: ActionOptions): number {
+  // `--store` answers one question -- where would a run land -- on one line
+  // with nothing else on it, so a script can read it. Creating, seeding and
+  // dropping the database an action writes to has to address the database the
+  // action writes to, and the profile's deployment target is what decides
+  // that; a second place to say it is a second place to say it differently.
+  if (options.store) {
+    // One line, because the caller is `STORE=$(kcmd action list --store)` and
+    // a second line makes that variable address the wrong database. A scope
+    // holding several models has no single answer, so it says so instead.
+    if (runtimes.length > 1) {
+      console.error(
+          `Error: this scope holds ${runtimes.length} models, which may ` +
+          `name different databases, so --store has no single answer. Narrow ` +
+          `the scope to one model.`);
+      return 1;
+    }
+    for (const {store, storeError} of runtimes) {
+      if (!store) {
+        console.error(`Error: ${storeError}`);
+        return 1;
+      }
+      console.log(storeLine(store));
+    }
+    return 0;
+  }
+
+  for (const {model, store, storeError, profile, entryGroup} of runtimes) {
+    console.log(
+        `Model '${model.name}' (${entryGroup}), profile '${profile}':`);
+    // Where a run lands, said once at the top rather than left to be inferred
+    // from a profile file the reader would have to go open.
+    if (!store) {
+      console.log('  store: unavailable under this profile');
+      console.log(wrapTo(storeError ?? '', BODY_INDENT));
+    } else {
+      console.log(`  store: ${storeLine(store)}`);
+    }
     const actions = model.actions ?? [];
     if (!actions.length) {
       console.log('  declares no actions.');
@@ -1346,6 +1290,181 @@ function listActions(
 }
 
 
+export interface AgentOptions {
+  // `string|boolean` for the same reason the others are: cac yields `true` for
+  // a bare `--profile` and `false` for `--no-profile`.
+  profile?: string|boolean;
+}
+
+
+// Prints what an agent is handed when it is pointed at this model.
+//
+//   kcmd agent tools
+//
+// Two halves and an instruction, all three derived: one lookup per entity, one
+// write per action, and what to tell the agent about using them. Nothing here
+// is written for a particular agent, which is the property worth being able to
+// see -- the listing is the same whether the caller is ADK, LangChain or a
+// person reading it to decide whether the model says enough.
+//
+// A tool the runtime cannot run today is listed and marked rather than
+// dropped. The model declares it; what it is waiting on is the useful thing to
+// print. `kcmd action run` calls the write half; the read half is a SELECT the
+// tool would issue, and `gcloud spanner databases execute-sql` will run it.
+//
+// Returns a process exit code (0 on success).
+export async function agent(
+    command: string, options: AgentOptions = {}): Promise<number> {
+  if (command !== 'tools') {
+    console.error(
+        `Error: unknown agent command '${command}'; expected 'tools'.`);
+    return 1;
+  }
+
+  const ctx = context.ApiContext.default();
+  const named =
+      typeof options.profile === 'string' ? options.profile : undefined;
+  const opened = await createSemanticRuntimes({profile: named, ctx});
+  if ('error' in opened) {
+    console.error(`Error: ${opened.error}`);
+    return 1;
+  }
+
+  let incomplete = false;
+  for (const runtime of opened) {
+    const {model, store, storeError, profile, entryGroup} = runtime;
+    // A tool is a thing that can be called, and calling one needs a store, so
+    // there is no honest listing without one. A model whose profile supplies
+    // no store offers no tools, which is reported for that model rather than
+    // ending the command: the rest of the scope still has an answer, and a
+    // partial listing followed by an error is the one outcome a reader cannot
+    // interpret.
+    console.log(
+        `Model '${model.name}' (${entryGroup}), profile '${profile}':`);
+    // A store this path cannot execute against is the same answer as no
+    // store, and has to be reported the same way: every tool would be listed
+    // uncallable, and a caller reading the exit code would take a listing that
+    // offers nothing for a listing that offers everything.
+    const unusable = store ? spannerClientFor(store) : undefined;
+    const why = store ? (unusable && 'error' in unusable ? unusable.error : '') :
+                        storeError ?? '';
+    if (!store || why) {
+      console.log('  offers no tools under this profile.');
+      console.log(wrapTo(why, BODY_INDENT));
+      console.log();
+      incomplete = true;
+      continue;
+    }
+    console.log(`  store: ${storeLine(store)}`);
+    console.log();
+
+    const {lookups, actions, instruction} = modelTools({runtime});
+    for (const tool of actions) printActionTool(tool);
+    for (const tool of lookups) printLookupTool(tool);
+    console.log('  instruction:');
+    console.log(indentBlock(instruction));
+    console.log();
+  }
+  return incomplete ? 1 : 0;
+}
+
+
+// How a store is written down for a reader: the resource it addresses, with
+// the backend named when it is not the Spanner one an action expects. Shared
+// by `--store`, which a script reads, and the listing header a person reads,
+// so the two never disagree about where a run would land.
+function storeLine(store: Store): string {
+  return store.kind === 'spanner' ?
+      `${store.project}/${store.instance}/${store.database}` :
+      `bigquery:${store.project}/${store.dataset}`;
+}
+
+
+// A wrapped parameter line is indented past its name, so a continuation is not
+// mistaken for the next parameter.
+const PARAM_CONTINUATION = '          ';
+
+function printActionTool(tool: ActionTool): void {
+  console.log(`  action  ${tool.name}  (${tool.actionName})${
+      tool.runnable ? '' : '  [NOT RUNNABLE]'}`);
+  console.log(indentBlock(tool.description));
+  for (const p of tool.parameters) {
+    console.log(wrapTo(
+        `${p.name}: ${p.type}${p.required ? '' : '?'}  -- ${p.description}`,
+        BODY_INDENT, PARAM_CONTINUATION));
+  }
+  console.log();
+}
+
+
+function printLookupTool(tool: EntityTool): void {
+  console.log(`  lookup  ${tool.name}  (${tool.entityName})${
+      tool.runnable ? '' : '  [NOT READABLE]'}`);
+  console.log(indentBlock(tool.description));
+  // One line per filter, like an action's parameters: the point of this
+  // command is that it shows what the agent gets, and a bare list of names
+  // hides the half of it the model wrote.
+  for (const p of tool.parameters) {
+    const said = describedPart(p.description);
+    console.log(wrapTo(
+        `${p.name}: ${p.type}${said ? `  -- ${said}` : ''}`, BODY_INDENT,
+        PARAM_CONTINUATION));
+  }
+  if (!tool.runnable) {
+    console.log(indentBlock(`NOT READABLE: ${tool.unavailable}`));
+  }
+  console.log();
+}
+
+
+// The model's half of a filter description, without the sentence the
+// derivation appends to every one of them. Printing that sentence once per
+// filter would bury what is actually worth reading.
+function describedPart(description: string): string {
+  // From the end: the derivation appends its sentence last, and a model is
+  // free to use the word in its own.
+  const boilerplate = description.lastIndexOf('Match ');
+  return boilerplate <= 0 ? '' : description.slice(0, boilerplate).trim();
+}
+
+
+// A description or an instruction, indented under the line that introduces it.
+// Both arrive as prose the model's author wrote and wrapped where they liked,
+// so each line is re-indented rather than the block as a whole.
+function indentBlock(text: string): string {
+  return text.trim()
+      .split('\n')
+      .map(line => line.trim() ? wrapTo(line.trim(), BODY_INDENT) : '')
+      .join('\n');
+}
+
+
+// This listing is read by a person deciding whether the model says enough, and
+// some of what it prints -- a model's instructions, the reason a tool is
+// withheld -- runs to several hundred characters. Emitting that as one line
+// leaves the terminal to fold it at column zero, which loses the indent that
+// shows what belongs to which tool. So it is folded here instead, and a
+// continuation is indented past the first line to keep the structure visible.
+const LISTING_WIDTH = 79;
+const BODY_INDENT = '      ';
+
+function wrapTo(text: string, indent: string, hanging = indent): string {
+  const lines: string[] = [];
+  let line = '';
+  for (const word of text.split(/\s+/).filter(w => w)) {
+    const prefix = lines.length ? hanging : indent;
+    if (line && `${prefix}${line} ${word}`.length > LISTING_WIDTH) {
+      lines.push(prefix + line);
+      line = word;
+    } else {
+      line = line ? `${line} ${word}` : word;
+    }
+  }
+  if (line) lines.push((lines.length ? hanging : indent) + line);
+  return lines.join('\n');
+}
+
+
 // One parameter as `name (Type)`, marking an object reference as such: that is
 // the difference between passing a value and passing something the runtime has
 // to look up first.
@@ -1363,8 +1482,8 @@ function runLine(a: Action): string {
 
 // Runs one action against the store its model's deployment target names.
 async function runOneAction(
-    models: LoadedModel[], ctx: context.ApiContext, name: string|undefined,
-    options: ActionOptions): Promise<number> {
+    runtimes: SemanticRuntime[], ctx: context.ApiContext,
+    name: string|undefined, options: ActionOptions): Promise<number> {
   if (!name) {
     console.error(
         'Error: `kcmd action run` needs an action name; `kcmd action list` ' +
@@ -1373,10 +1492,10 @@ async function runOneAction(
   }
 
   const declaring =
-      models.filter(m => (m.model.actions ?? []).some(a => a.name === name));
+      runtimes.filter(r => (r.model.actions ?? []).some(a => a.name === name));
   if (!declaring.length) {
     const known =
-        models.flatMap(m => (m.model.actions ?? []).map(a => a.name)).sort();
+        runtimes.flatMap(r => (r.model.actions ?? []).map(a => a.name)).sort();
     console.error(
         `Error: no model in this scope declares an action '${name}'` +
         (known.length ? `; declared: ${known.join(', ')}.` : '.'));
@@ -1385,11 +1504,11 @@ async function runOneAction(
   if (declaring.length > 1) {
     console.error(
         `Error: '${name}' is declared by ${declaring.length} models (${
-            declaring.map(m => m.model.name).join(', ')}), so which one to ` +
+            declaring.map(r => r.model.name).join(', ')}), so which one to ` +
         `run is ambiguous.`);
     return 1;
   }
-  const model = declaring[0].model;
+  const runtime = declaring[0];
 
   // `list` reads the model as authored and is happy with whatever it finds.
   // `run` executes it, and the runtime's refusal gate trusts what validation
@@ -1401,7 +1520,8 @@ async function runOneAction(
   // Only the model being run. A scope holds many documents, and a typo in one
   // the run will not touch is a real error to fix but not a reason to refuse
   // this call -- refusing on it would report a model the reader did not name.
-  const invalid = validateRunnable([declaring[0]]);
+  const invalid =
+      validateRunnable([{document: runtime.document, model: runtime.model}]);
   if (invalid.length) {
     for (const e of invalid) console.error(`Error: ${e}`);
     return 1;
@@ -1413,15 +1533,22 @@ async function runOneAction(
     return 1;
   }
 
-  const store = spannerClientFor(model, ctx);
-  if ('error' in store) {
-    console.error(`Error: ${store.error}`);
+  if (!runtime.store) {
+    console.error(`Error: ${runtime.storeError}`);
     return 1;
   }
 
-  console.log(`Running '${name}' on ${store.client.database}...`);
-  const outcome = await runAction(
-      {model, actionName: name, args: parsed.args, client: store.client});
+  // Before the banner, because the banner says where the run lands and a
+  // store no statement can reach is not somewhere it lands.
+  const client = runtimeClient(runtime);
+  if ('error' in client) {
+    console.error(`Error: ${client.error}`);
+    return 1;
+  }
+
+  console.log(`Running '${name}' on ${runtime.store.name}...`);
+  const outcome =
+      await runAction({runtime, actionName: name, args: parsed.args});
   if (outcome.status === 'error') {
     console.error(`Error: ${outcome.message}`);
     return 1;
@@ -1468,98 +1595,4 @@ function parseActionArgs(raw: unknown):
     args[name] = pair.slice(eq + 1);
   }
   return {args};
-}
-
-
-// A Spanner table an entity is bound to.
-const SPANNER_TABLE_SOURCE =
-    /^\/\/spanner\.googleapis\.com\/projects\/([A-Za-z0-9_-]+)\/instances\/([A-Za-z0-9_-]+)\/databases\/([A-Za-z0-9_-]+)\/tables\/.+$/;
-
-
-// The store an action runs against: the Spanner database this profile's
-// deployment target names. The command line never names it, so pointing a run
-// at another store is selecting another profile.
-//
-// Checking that the entity bindings agree with the target matters more here
-// than in any other leg. An action's statements address a table by its NAME,
-// with the project/instance/database qualifier dropped, so an entity bound to
-// another database still produces a statement that runs -- against whatever
-// table of that name the target database happens to hold. Nothing later would
-// report it.
-function spannerClientFor(model: SemanticModel, ctx: context.ApiContext):
-    {client: SpannerDataClient}|{error: string} {
-  const {spanner, bigQuery} = googleDeploymentTargets(model);
-  if (spanner.length > 1) {
-    return {
-      error: `Model '${model.name}' declares ${spanner.length} Spanner ` +
-          `deployment targets under this profile, so which database the ` +
-          `action writes to is ambiguous. Give each its own profile.`,
-    };
-  }
-  if (!spanner.length) {
-    return {
-      error: `Model '${model.name}' declares no Spanner deployment target ` +
-          `under this profile, and an action runs against Spanner` +
-          (bigQuery.length ?
-               ` (this profile deploys to BigQuery, which it cannot write to)` :
-               '') +
-          `. Select a profile whose deployment target is a Spanner database.`,
-    };
-  }
-
-  const target = spanner[0];
-  const database = `projects/${target.project}/instances/${
-      target.instance}/databases/${target.database}`;
-  // Every table the model binds, not just its entities: a many-to-many
-  // relationship is backed by a junction table of its own, and an action that
-  // creates the edge writes to exactly that one. No loader produces an
-  // association yet, so this leg is dormant -- but the day one does, the
-  // failure it prevents is a write landing in a different database silently,
-  // which is not the kind of thing to notice afterwards.
-  const bindings: Array<{name: string; source: string}> = [];
-  for (const entity of model.entities ?? []) {
-    bindings.push({name: entity.name, source: entity.dataSource ?? ''});
-  }
-  for (const relationship of model.relationships ?? []) {
-    const source = relationship.association?.dataSource;
-    if (source) bindings.push({name: relationship.name, source});
-  }
-
-  const strays: string[] = [];
-  for (const binding of bindings) {
-    const source = binding.source.trim();
-    // Nothing bound is not a mis-binding: the entity is declared and this
-    // profile supplies it no table, which the statements will report on their
-    // own terms when they name a table that is not there.
-    if (!source) continue;
-    const bound = source.match(SPANNER_TABLE_SOURCE);
-    // A source that is not a Spanner table at all -- a BigQuery URI, say --
-    // is the same hazard and a likelier one: the statements would still run,
-    // against whatever table of that name the target database holds, and the
-    // data the model describes would sit untouched in the other system.
-    if (!bound) {
-      strays.push(`'${binding.name}' to ${source}, which is not a table in ` +
-                  `this database`);
-      continue;
-    }
-    const boundDatabase =
-        `projects/${bound[1]}/instances/${bound[2]}/databases/${bound[3]}`;
-    if (boundDatabase !== database) {
-      strays.push(`'${binding.name}' to ${boundDatabase}`);
-    }
-  }
-  if (strays.length) {
-    return {
-      error: `Model '${model.name}' binds ${strays.join(', ')}, but its ` +
-          `deployment target is ${database}. An action's statements address a ` +
-          `table by name alone, so the write would land in the target ` +
-          `database's table of that name rather than in the bound one. Bind ` +
-          `both to the same database.`,
-    };
-  }
-
-  return {
-    client: new SpannerDataClient(
-        ctx, target.project, target.instance, target.database),
-  };
 }
