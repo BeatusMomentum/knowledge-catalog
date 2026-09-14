@@ -20,6 +20,7 @@ import {provisionCustomTypes} from '../libts/semantic/kc_custom_types';
 import {LoadedModel, loadSemanticModels} from '../libts/semantic/loader';
 import {serializeModel} from '../libts/semantic/osi_converter';
 import {pullKnowledgeCatalog} from '../libts/semantic/pull_kc';
+import {GeminiJudge} from '../libts/gcp/gemini';
 import {runAction} from '../libts/semantic/runtime/run_action';
 import {transpileModels} from '../libts/semantic/transpile';
 import {validateBigQueryDataSources, validatePushRequirements, validateRunnable} from '../libts/semantic/validate';
@@ -1171,6 +1172,11 @@ export interface ActionOptions {
   profile?: string|boolean;
   // `--store`: print where a run would land and nothing else (`list` only).
   store?: boolean;
+  // `--judge [model]`: settle the guards stated in words by asking Gemini.
+  // `true` for a bare `--judge`, which takes the default model.
+  judge?: string|boolean;
+  // `--judge-location <region>`: the Vertex AI region to ask in.
+  judgeLocation?: string;
 }
 
 
@@ -1546,9 +1552,17 @@ async function runOneAction(
     return 1;
   }
 
+  // Built from the context this command already holds, so judging costs no
+  // second trip to gcloud for a project and a token.
+  const judge = options.judge ? new GeminiJudge(ctx, {
+    ...(typeof options.judge === 'string' ? {model: options.judge} : {}),
+    ...(options.judgeLocation ? {location: options.judgeLocation} : {}),
+  }) : undefined;
+
   console.log(`Running '${name}' on ${runtime.store.name}...`);
+  if (judge) console.log(`  rules stated in words go to ${judge.name}`);
   const outcome =
-      await runAction({runtime, actionName: name, args: parsed.args});
+      await runAction({runtime, actionName: name, args: parsed.args, judge});
   if (outcome.status === 'error') {
     console.error(`Error: ${outcome.message}`);
     return 1;
@@ -1559,6 +1573,9 @@ async function runOneAction(
     console.log(
         `  ${param}: '${ref.input}' -> ${ref.entity} ${ref.keys.join('/')}`);
   }
+  // Before the commit line, so the last thing printed is what happened to the
+  // write rather than a caveat about it.
+  for (const w of outcome.warnings ?? []) console.warn(`Warning: ${w}`);
   console.log(`Committed${
       outcome.commitTimestamp ? ` at ${outcome.commitTimestamp}` : ''}.`);
   return 0;

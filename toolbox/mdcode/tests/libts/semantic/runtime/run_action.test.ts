@@ -14,7 +14,8 @@ import {describe, expect, test} from 'bun:test';
 import * as spanner from '../../../../src/libts/gcp/spanner';
 import {Action, Constraint, SemanticModel} from '../../../../src/libts/semantic/ir';
 import {SemanticRuntime} from '../../../../src/libts/semantic/runtime/runtime';
-import {ActionPlan, runAction, RunActionOptions} from '../../../../src/libts/semantic/runtime/run_action';
+import {Judge, JudgeRequest, JudgeVerdict} from '../../../../src/libts/semantic/runtime/judge';
+import {ActionPlan, runAction, RunActionOptions, whyRefusedWithoutRunning} from '../../../../src/libts/semantic/runtime/run_action';
 
 
 // `runAction` takes a runtime: a model paired with the store it runs against.
@@ -303,11 +304,16 @@ describe('resolving an entity-typed argument', () => {
   });
 
   test('rejects a missing required reference', async () => {
-    const outcome =
-        await run(resolvingFake(), {args: {target: 'A2', amount: 100}});
+    // The message alone does not pin this. `resolveArguments` says the same
+    // sentence from inside the transaction, so the assertion below holds with
+    // the pre-flight deleted. What the pre-flight buys is saying it before a
+    // session is opened.
+    const fake = resolvingFake();
+    const outcome = await run(fake, {args: {target: 'A2', amount: 100}});
     if (outcome.status !== 'error') throw new Error('expected an error');
     expect(outcome.message)
         .toContain("requires 'source', a reference to a Account");
+    expect(fake.sessionsOpened).toBe(0);
   });
 
   test('leaves scalar arguments alone', async () => {
@@ -745,6 +751,361 @@ describe('a guarded action is refused, not run unchecked', () => {
     if (outcome.status !== 'error') throw new Error('expected an error');
     expect(outcome.message).toContain("'ZBalance' and 'AEntry'");
   });
+});
+
+
+describe('a guard settled by judgment', () => {
+  class ScriptedJudge implements Judge {
+    readonly name = 'scripted';
+    readonly asked: JudgeRequest[] = [];
+
+    constructor(private readonly answer: JudgeVerdict|Error) {}
+
+    async decide(request: JudgeRequest): Promise<JudgeVerdict> {
+      this.asked.push(request);
+      if (this.answer instanceof Error) throw this.answer;
+      return this.answer;
+    }
+  }
+
+  const holds = () => new ScriptedJudge({holds: true, reason: 'It names one.'});
+  const doesNot = () => new ScriptedJudge(
+      {holds: false, reason: 'The memo names no service failure.'});
+  const unreachable = () =>
+      new ScriptedJudge(new Error('Vertex AI returned 503'));
+
+  const justified: Constraint = {
+    name: 'CreditIsJustified',
+    judgment: 'The memo must name a specific service failure.',
+    description: 'A credit needs a stated reason.',
+    onViolation: 'reject',
+  };
+  const advisory: Constraint = {...justified, onViolation: 'warn'};
+  const approvable: Constraint = {...justified, onViolation: 'escalate'};
+
+  const guarding = (constraints: Constraint[]) => creditModel({
+    actions: [{...credit, guards: constraints.map(c => c.name)}],
+    constraints,
+  });
+
+  const runWith =
+      (constraints: Constraint[], judge?: Judge, fake = resolvingFake()) =>
+          act({
+            model: guarding(constraints),
+            actionName: 'Credit',
+            args: {account: 'A1', amount: 100},
+            client: fake.client,
+            judge,
+          });
+
+  test('a verdict that holds lets the write through', async () => {
+    const judge = holds();
+    const fake = resolvingFake();
+    const outcome = await runWith([justified], judge, fake);
+    if (outcome.status !== 'committed') throw new Error(outcome.message);
+    // Asked, rather than assumed to hold. A judge that was never called and a
+    // judge that said yes produce the same outcome, and only one of the two is
+    // the runtime working.
+    expect(judge.asked).toHaveLength(1);
+    expect(fake.committed).toBe(true);
+    expect(outcome.warnings).toBeUndefined();
+  });
+
+  test('the judge is given the rule as the author wrote it', async () => {
+    const judge = holds();
+    await runWith([justified], judge);
+    expect(judge.asked[0].rule)
+        .toBe('The memo must name a specific service failure.');
+    expect(judge.asked[0].constraint).toBe('CreditIsJustified');
+    expect(judge.asked[0].action).toBe('Credit');
+    expect(judge.asked[0].actionDescription)
+        .toBe('Credit an account and record the entry.');
+  });
+
+  test('the judge is given the arguments as the caller stated them',
+       async () => {
+         // Before resolution, which is the point of asking here: 'A1' is what
+         // the caller said, and the key it resolves to would tell a judge
+         // nothing.
+         const judge = holds();
+         await runWith([justified], judge);
+         expect(judge.asked[0].arguments).toEqual({account: 'A1', amount: 100});
+       });
+
+  test('a verdict that does not hold refuses before anything opens',
+       async () => {
+         // Why a judgment settles here at all: a refused call costs the store
+         // no session, no transaction, and no write locks held across a call
+         // that takes seconds.
+         const fake = resolvingFake();
+         const outcome = await runWith([justified], doesNot(), fake);
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(fake.sessionsOpened).toBe(0);
+         expect(fake.statements).toHaveLength(0);
+         expect(fake.committed).toBe(false);
+         expect(fake.rolledBack).toBe(false);
+       });
+
+  test('the refusal carries the author words and the judge reason',
+       async () => {
+         const outcome = await runWith([justified], doesNot());
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(outcome.message).toContain("'CreditIsJustified'");
+         expect(outcome.message)
+             .toContain('The memo must name a specific service failure.');
+         expect(outcome.message).toContain('A credit needs a stated reason.');
+         expect(outcome.message)
+             .toContain('The memo names no service failure.');
+         // A caller told a transaction rolled back goes looking for a write
+         // that never reached the store.
+         expect(outcome.message).toContain('No transaction was opened');
+         expect(outcome.message).not.toContain('rolled back');
+       });
+
+  test('an escalation says an approver may allow it', async () => {
+    // `escalate` states that an approver exists. Nothing here is one, and a
+    // refusal that did not say so would read as the end of the matter.
+    const outcome = await runWith([approvable], doesNot());
+    if (outcome.status !== 'error') throw new Error('expected an error');
+    expect(outcome.message).toContain('escalate');
+    expect(outcome.message).toContain('an approver may allow it');
+  });
+
+  test('an advisory verdict that does not hold still commits, and is reported',
+       async () => {
+         const fake = resolvingFake();
+         const outcome = await runWith([advisory], doesNot(), fake);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(fake.committed).toBe(true);
+         // A caller that never sees this has been told the write was clean
+         // when the model said it was not.
+         expect(outcome.warnings).toHaveLength(1);
+         expect(outcome.warnings?.[0]).toContain('CreditIsJustified');
+         expect(outcome.warnings?.[0])
+             .toContain('The memo names no service failure.');
+       });
+
+  test('a judge that cannot be reached stops a rule that stops things',
+       async () => {
+         // Nothing here knows whether the rule holds, and a rule whose word is
+         // `reject` routes that the way it routes a breach.
+         const fake = resolvingFake();
+         const outcome = await runWith([justified], unreachable(), fake);
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(outcome.message).toContain('Vertex AI returned 503');
+         expect(fake.sessionsOpened).toBe(0);
+         expect(fake.committed).toBe(false);
+       });
+
+  test('a judge that cannot be reached does not stop an advisory rule',
+       async () => {
+         const fake = resolvingFake();
+         const outcome = await runWith([advisory], unreachable(), fake);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(fake.committed).toBe(true);
+         // Reported rather than dropped: the model asked for a check it did
+         // not get, which is the part a caller can act on.
+         expect(outcome.warnings?.[0]).toContain('was not checked');
+         expect(outcome.warnings?.[0]).toContain('Vertex AI returned 503');
+       });
+
+  test('with no judge the action is refused, and the refusal says why',
+       async () => {
+         const fake = resolvingFake();
+         const outcome = await runWith([justified], undefined, fake);
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(outcome.message).toContain('no judge to ask');
+         expect(fake.sessionsOpened).toBe(0);
+       });
+
+  test('a call missing an argument is answered before a judge is asked',
+       async () => {
+         // A judge handed an incomplete call answers about the rule, so the
+         // caller would be told the rule was broken rather than that an
+         // argument was never supplied -- and a model call would be spent
+         // saying it.
+         const judge = holds();
+         const fake = resolvingFake();
+         const outcome = await act({
+           model: guarding([justified]),
+           actionName: 'Credit',
+           args: {account: 'A1'},
+           client: fake.client,
+           judge,
+         });
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(judge.asked).toHaveLength(0);
+         expect(fake.sessionsOpened).toBe(0);
+         expect(outcome.message).toContain('amount');
+         expect(outcome.message).toContain('was not given a value');
+       });
+
+  test('an advisory guard stated as an expression is reported as unchecked',
+       async () => {
+         // Supplying a judge settles the rules stated in words and nothing
+         // else. An expression guard that never stopped the call was never
+         // checked either, and a caller shown no line for it reads the commit
+         // as having met every rule the model states.
+         const ceiling: Constraint = {
+           name: 'CreditUnderCeiling',
+           expression: 'amount <= 25',
+           onViolation: 'warn',
+         };
+         const fake = resolvingFake();
+         const outcome = await runWith([ceiling], holds(), fake);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(fake.committed).toBe(true);
+         expect(outcome.warnings?.[0]).toContain('CreditUnderCeiling');
+         expect(outcome.warnings?.[0]).toContain('amount <= 25');
+         expect(outcome.warnings?.[0]).toContain('is an expression');
+       });
+
+  test('a guard stating no rule at all is not called an expression',
+       async () => {
+         // A constraint may reach the runtime with neither body through the
+         // library entry point. Reporting it as an expression names a kind of
+         // rule the constraint never states, and the citation cannot quote one
+         // either, so the caller is given nothing to check the claim against.
+         const bodyless: Constraint = {name: 'NoRule', onViolation: 'warn'};
+         const fake = resolvingFake();
+         const outcome = await runWith([bodyless], holds(), fake);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(fake.committed).toBe(true);
+         expect(outcome.warnings?.[0]).toContain('NoRule');
+         expect(outcome.warnings?.[0]).toContain('states no rule to check');
+         expect(outcome.warnings?.[0]).not.toContain('expression');
+       });
+
+  test('an advisory expression guard lets the judged one still be asked',
+       async () => {
+         // An expression guard declaring `warn` stands down, so an action
+         // guarding on both kinds does reach the judge and does commit. The
+         // expression still gets its own warning line.
+         const ceiling: Constraint = {
+           name: 'CreditUnderCeiling',
+           expression: 'amount <= 25',
+           onViolation: 'warn',
+         };
+         const judge = holds();
+         const fake = resolvingFake();
+         const outcome = await runWith([ceiling, justified], judge, fake);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(judge.asked).toHaveLength(1);
+         expect(outcome.warnings?.some(w => w.includes('CreditUnderCeiling')))
+             .toBe(true);
+       });
+
+  test('a judgment with no words refuses rather than asking about nothing',
+       async () => {
+         // An empty rule put to a judge comes back "not enough to tell", so
+         // every call would be refused and the citation could not quote what
+         // was broken.
+         const judge = holds();
+         const blank: Constraint = {...justified, judgment: '   '};
+         const outcome = await runWith([blank], judge);
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(judge.asked).toHaveLength(0);
+         expect(outcome.message).toContain('CreditIsJustified');
+         expect(outcome.message)
+             .toContain(
+                 `'CreditIsJustified', which states a judgment with no ` +
+                 `words in it.`);
+       });
+
+  test('an advisory judgment with no words is reported, never asked',
+       async () => {
+         // An advisory guard is never refused, so this is the one path on
+         // which an empty rule could still have reached a judge.
+         const judge = holds();
+         const blank: Constraint = {...advisory, judgment: ''};
+         const outcome = await runWith([blank], judge);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(judge.asked).toHaveLength(0);
+         expect(outcome.warnings?.[0]).toContain('states no words');
+       });
+
+  test('a verdict missing its answer is reported, not thrown', async () => {
+    // `Judge` is a seam a caller implements, so a verdict can arrive without
+    // the fields its type promises. runAction states that it returns an
+    // outcome for every expected failure, and a TypeError escaping it would
+    // reach the CLI as a stack trace and an agent tool as a rejection.
+    const malformed = new ScriptedJudge({} as unknown as JudgeVerdict);
+    const outcome = await runWith([justified], malformed);
+    if (outcome.status !== 'error') throw new Error('expected an error');
+    expect(outcome.message).toContain('did not say whether the rule holds');
+    expect(outcome.message).toContain('nothing was written');
+  });
+
+  test('a verdict that does not hold and states no reason still refuses',
+       async () => {
+         const terse = new ScriptedJudge(
+             {holds: false, reason: undefined as unknown as string});
+         const outcome = await runWith([justified], terse);
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(outcome.message).toContain('does not hold for this call');
+       });
+
+  test('an advisory guard nobody could ask about is reported, not dropped',
+       async () => {
+         // A warn rule does not stop the call, so the call runs with no judge.
+         // Committing in silence would tell the caller every rule passed, when
+         // one of them was never put to anybody.
+         const fake = resolvingFake();
+         const outcome = await runWith([advisory], undefined, fake);
+         if (outcome.status !== 'committed') throw new Error(outcome.message);
+         expect(fake.committed).toBe(true);
+         expect(outcome.warnings?.[0]).toContain('CreditIsJustified');
+         expect(outcome.warnings?.[0]).toContain('was not checked');
+         expect(outcome.warnings?.[0]).toContain('no judge');
+       });
+
+  test('a guard stated as an expression is refused whatever judge is given',
+       async () => {
+         // Supplying a judge does not make an expression computable here, and
+         // a message about a missing judge would send the caller the wrong
+         // way.
+         const outcome = await runWith(
+             [{name: 'UnderCeiling', expression: 'amount <= 50'}], holds());
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(outcome.message).toContain('does not evaluate constraints yet');
+         expect(outcome.message).not.toContain('no judge to ask');
+       });
+
+  test('what a run does and what a tool advertises agree', async () => {
+    // agent_tools.ts asks this before offering the action. A tool advertised
+    // as runnable and then refused mid-call spends the caller's turn and
+    // teaches it nothing.
+    const guarded = guarding([justified]);
+    const action = guarded.actions![0];
+    expect(whyRefusedWithoutRunning(guarded, action))
+        .toContain('no judge to ask');
+    expect(whyRefusedWithoutRunning(guarded, action, undefined, holds()))
+        .toBeNull();
+  });
+});
+
+
+describe('the pre-flight over an incomplete call', () => {
+  test('leaves a scalar alone when a handler supplies the write', async () => {
+    // A handler is handed the arguments whole and decides for itself which of
+    // them it needs, so binding every declared scalar on its behalf would
+    // refuse a call it can perform. Only the entity references are the
+    // runtime's business here, because the runtime resolves those itself.
+    const fake = resolvingFake();
+    const outcome = await run(fake, {args: {source: 'A1', target: 'A2'}});
+    if (outcome.status !== 'committed') throw new Error(outcome.message);
+    expect(fake.committed).toBe(true);
+  });
+
+  test('still refuses a missing entity reference under a handler',
+       async () => {
+         // The runtime resolves references itself, whoever performs the write.
+         const fake = resolvingFake();
+         const outcome = await run(fake, {args: {source: 'A1', amount: 100}});
+         if (outcome.status !== 'error') throw new Error('expected an error');
+         expect(outcome.message).toContain('target');
+         expect(fake.sessionsOpened).toBe(0);
+       });
 });
 
 
