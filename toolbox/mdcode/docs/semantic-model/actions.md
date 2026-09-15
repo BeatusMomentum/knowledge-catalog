@@ -12,7 +12,7 @@ An **action** closes that gap. It's a named write operation declared over the
 same concepts as the rest of your model: you give it a name, type its inputs
 against your ontology, and say which concepts a call changes. Publishing it puts
 the operation in the same place as the data it acts on, so an agent that
-discovers your model discovers what it can change there, not just what it can
+discovers your model discovers what it can change there as well as what it can
 ask.
 
 One part of an action is physical — how the write actually happens. That part
@@ -85,7 +85,7 @@ semantic_model:
         primary_key: [transferId]
         source: my-project.bank.transfer
         fields:
-          - { name: transferId, datatype: Integer, expression: transfer_id }
+          - { name: transferId, datatype: String,  expression: transfer_id }
           - { name: amount,     datatype: Float,   expression: amount }
           - { name: debitedId,  datatype: Integer, expression: debited_account_id }
     relationships:
@@ -319,6 +319,14 @@ a breach does. So guarding a constraint that declares `warn` is a real shape.
 Your organization may not be ready to block on a rule; guarding it anyway still
 gets the rule checked at the moment of the call and reported back.
 
+When one call violates several guards, the strictest outcome applies. Any
+`reject` refuses the call, failing that any `escalate` holds it, and failing
+that any `warn` lets it through with the violations reported. The precedence is
+fixed and nothing in your model states it, so an action can name any number of
+guards without you writing down how they combine. It is also how `forbid`
+overrides `permit` in Cedar and how a deny wins in Open Policy Agent, so a
+policy written this way lowers into either.
+
 kcmd reports a mismatch from either side. A guard that names no constraint fails
 the push. A constraint over parameters that no action names loads with a
 warning, because nothing will ever evaluate it. That scan reads expressions
@@ -391,6 +399,17 @@ before the transaction opens, so "an order's total equals the sum of its lines"
 has nothing to look at yet. Put that rule inside the transaction or in your
 schema.
 
+An action whose guards are *all* judged loads with a warning today. Every gate
+then costs a model call, none can lower to a store-level check, and each may
+decide two identical calls differently.
+
+The warning doesn't mean you've written something wrong. Some operations really
+are governed only by rules no expression settles, so an all-judged action can
+be exactly right. The warning puts that cost in your source rather than leaving
+you to find it in a published model. Whether a warning is the right response is
+still open, so treat it as current behavior rather than a rule to design
+around.
+
 **Status: a judgment is the one body kcmd settles.** At run time,
 [`kcmd action run --judge`](#a-guard-settled-in-words) puts each judged guard to
 a language model and routes the verdict by `on_violation`.
@@ -441,7 +460,7 @@ value is on record and has to be read, because the judge decides for itself
 whether to look. The same rule refuses every call when it goes to a judge that
 can't read. See [a guard that reads a row](#a-guard-that-reads-a-row).
 
-### A policy whose rules end differently
+## A credit policy, worked through
 
 Real policies have several rules, and the rules rarely end the same way. A
 support agent is about to issue a customer-service credit, and five separate
@@ -541,14 +560,10 @@ Each `on_violation` key carries one branch of what your policy describes in
 prose, in a form a search can read.
 
 **Rule 3 declares `reject`, because it's the one rule here nobody in the
-business may approve.** An order whose total disagrees with its line items is
-broken rather than merely unusual. That word takes effect only once
-`IssueCredit` names the rule in `guards`.
-
-Naming it makes `IssueCredit` refuse to run against an order whose books already
-disagree. It won't catch a credit that *breaks* that agreement, because that
-means checking the state the write produces, and your model can't bind such a
-check yet. A guard therefore enforces rule 3 more narrowly than the rule reads.
+business may approve.** An order whose total disagrees with its line items is a
+broken order rather than an unusual one. As a guard the rule reaches less far
+than it reads. `IssueCredit` refuses to run against an order whose books already
+disagree, and lets through a credit that would break the agreement itself.
 
 **Rules 4 and 5 are the reason `judgment` exists.** Neither reduces to
 arithmetic over `Order` and `LineItem`, so before a judged body there was
@@ -565,7 +580,7 @@ publishes it instead of forbidding it, and makes it findable. Its `evaluation`
 field reads `judged`, so an auditor asking which unappealable rules your model
 settles gets an answer from one query.
 
-### Two calls through that policy
+### Two calls through the policy
 
 Here are two calls against order 12345, which totals $165.85. One is a
 30-dollar credit for a shipping charge billed in error. The other is three
@@ -596,19 +611,10 @@ for. Every gate a query can compute lets it through, because each 9-dollar
 credit sits under the order's total and under the 25-dollar ceiling on its own,
 and only reading the three together as one 27-dollar credit puts them over it.
 
-When one call violates several guards, the strictest outcome applies. Any
-`reject` refuses the call; failing that, any `escalate` holds it; failing that,
-any `warn` lets it through with the violations reported.
-
-That combination is fixed, and no part of your model states it, so your action
-can name any number of guards without you writing down how to combine them. The
-same precedence is how `forbid` overrides `permit` in Cedar and how a deny wins
-in Open Policy Agent, so a policy written this way lowers into either.
-
-An action whose guards are *all* judged loads with a warning. Every gate then
-costs a model call, none can lower to a store-level check, and each may decide
-two identical calls differently. `IssueCredit` stays clear of that: three of its
-five guards are expressions.
+Three of `IssueCredit`'s five guards are expressions, so it stays clear of the
+all-judged warning. The bottom row of table 2 applies the strictest-outcome
+rule from section 2 — an `escalate` with nothing stricter beside it holds the
+first call, and rule 5's `reject` decides the second.
 
 **Status: a run doesn't compute the strictest outcome.** `--judge` puts the
 judged guards to the judge in the order your model declares them and stops at
@@ -649,40 +655,47 @@ A record says more — which operation, and which fields the call writes:
 
 Be precise about the concepts you've worked out and coarse about the rest. The
 two shapes sit in one list together, so a vague entry costs you nothing on the
-ones you know. Every `concept` — bare, or named under the key — has to be
-something the same model declares.
+ones you know.
 
-### One key for both kinds
+`affects` declares the blast radius rather than limiting it. Naming one field
+doesn't stop a statement from writing others, and naming two concepts doesn't
+stop a call from touching a third; the list records what you mean the call to
+do.
+
+### What an entry may say
 
 `concept` takes an entity or a relationship, written the same way for either
 kind — your model already records which one it is. `TransferDebits` above is
-the edge from the example model, and it sits in the list exactly like the two
-entities beside it.
+the edge from the example model, and it sits in the list beside the two
+entities. Either way the name has to be one the same model declares.
 
-### The operations
+`operation` is `create`, `modify` or `delete`, the same three whatever the
+concept is, and a fourth word means your document doesn't parse. Leaving it out
+gives you the coarse form one entry at a time, covering every operation on that
+concept. Two entries on one concept with the same operation are a hard load
+error, and a bare entry beside one with an operation warns, because the bare
+one already covered what the second narrows.
 
-Use `create`, `modify` or `delete` — the same three whatever the concept is.
+`fields` names what a `create` or a `modify` writes, which makes *which actions
+can change `Account.balance`* answerable. A `delete` takes the whole instance,
+so a field named beside one is rejected rather than ignored.
 
-`modify` covers an edge too: a junction table backs a many-to-many relationship
-and has fields of its own, so *modify the grade on an Enrollment* is as
-ordinary a change as *modify an order's total*.
-
-Add `fields` to narrow a `create` or a `modify` to the fields the call writes,
-which makes *which actions can change `Account.balance`* answerable. A
-`delete` takes the whole instance, so a field named beside one is rejected,
-not ignored.
+On a relationship, `fields` means the junction table's own columns, so *modify
+the grade on an Enrollment* is as ordinary a change as *modify an order's
+total*. A plain foreign-key edge carries no columns of its own, and
+`TransferDebits` is one, so naming a field on it is an error — the property you
+meant belongs to an endpoint entity.
 
 Name the concept now and refine it later. Writing `- concept: Account` on its
 own says the same thing the bare `Account` does, and it's written back as the
 bare form.
 
-### A created row gets its key from kcmd
+### Declaring a `create` turns on key generation
 
-When an action **creates** a row, kcmd generates that row's primary key — a
-UUID — and binds it as `@new<Concept>Key`. The caller never supplies it,
-because an agent that picks its own primary keys can overwrite an existing row
-by choosing one already taken. Declaring the creation in `affects` turns the
-generation on:
+One entry in `affects` does more than describe the write. Writing
+`operation: create` tells kcmd to generate the new row's primary key — a UUID,
+bound as `@new<Concept>Key` — which your statement then uses like any other
+bound value:
 
 ```yaml
         executor:
@@ -695,14 +708,33 @@ generation on:
           - { concept: Transfer, operation: create }
 ```
 
-**Status: that key generation is the only thing `affects` drives.** Where a
-statement actually binds a generated key, kcmd checks your model first: a
-concept keyed by several columns, or by a key field that isn't a `String`,
-can't take a generated UUID, so kcmd refuses the call and withholds the write
-tool. A statement that supplies its own key is never refused over a generated
-one it doesn't use. Past that, kcmd parses `affects`, checks every concept
-against your model, publishes it and reads it back. No component computes an
-impact from it, routes on it, or checks it against what your executor does.
+The generation is there because an agent that picks its own primary keys can
+overwrite an existing row by choosing one already taken. So where a statement
+binds that name, the value comes from the runtime and no argument of the call
+can reach it.
+
+Only a `sql` executor generates a key. An `mcp`, `rest` or `grpc` action can
+declare a `create` and gets nothing bound, because the system on the other side
+of the call makes the row and picks its own identifier for it.
+
+Where a statement binds a generated key, kcmd reads your model before running
+anything. An entity keyed by several columns, or by a key field that isn't a
+`String`, can't take a UUID, so kcmd refuses the call rather than letting the
+store reject a statement it can't explain. The check reads entities, so a
+relationship passes it — an edge declares no key to read — and so does an
+entity whose key names a field the model doesn't declare. It runs at the call
+rather than at the push, so no push check surfaces it. A statement that
+supplies its own key is never refused over a generated one it doesn't use.
+
+**Status: nothing compares `affects` to what your executor does.** kcmd parses
+it, checks the concepts against your ontology, publishes it and reads it back,
+and no component reconciles the declaration with the statements or the tool
+call. Three things beyond those checks read it. Key generation is the one
+above. Resolving your model through a binding profile drops any action
+affecting a concept the profile can't bind, so that action never reaches the
+catalog. Publishing an action whose affected
+concept has no entry in the same push warns you that the catalog now records a
+blast radius naming something it can't resolve.
 
 ## 4. Check it before pushing
 
@@ -740,11 +772,19 @@ checked while nothing checks it. An `affects` entry naming `Acount` claims a
 blast radius over a concept that doesn't exist, so a consumer that reads it
 learns nothing.
 
-kcmd checks the rest of an `affects` entry just as strictly. Fields
-beside a `delete` are a hard error, and so is a field the concept doesn't
-declare. An operation outside `create` / `modify` / `delete` never gets this far
-— the vocabulary is closed, so your document doesn't parse at all. These checks
-are static, so they run on every push whatever the destination.
+kcmd checks the rest of an `affects` entry just as strictly. Fields beside a
+`delete` are a hard error, and so is a field the concept doesn't declare. An
+operation outside `create` / `modify` / `delete` never gets this far — the
+vocabulary is closed, so your document doesn't parse at all.
+
+The two checks that read your ontology stand down when a binding profile
+resolves your model. Resolving drops entities and relationships the profile
+can't bind, so holding `affects` to the ontology there would fail your deploy
+over a concept the profile removed rather than one you mistyped. An undeclared
+concept and an undeclared field fall back to the warning the loader already
+gave. A catalog-only push and `kcmd action run` read the author's model
+whole, so both treat the same two as hard errors. Fields beside a `delete` read
+only the entry, so that one fails everywhere.
 
 ### What push holds a statement to
 
@@ -941,10 +981,8 @@ kcmd reports both instead of guessing, because both are things you can act on.
 
 **Targeting the write.** Resolution produces a *value*, and your statement uses
 it. The statement's own `WHERE` clause decides how many rows it lands on, and
-nothing would stop one that hits every dormant account. `affects` declares the
-blast radius rather than limiting it, so that a reader knows what the write is
-about and an evaluator can one day check the statements against what you
-declared.
+nothing would stop one that hits every dormant account. That is what section 3
+means by `affects` declaring the blast radius rather than limiting it.
 
 `kcmd action run` does three things:
 
@@ -1033,8 +1071,8 @@ kcmd action run IssueCredit --arg order=12347 --arg amount=5 \
     --arg memo="customer asked for a credit" --judge
 ```
 
-That call runs against a commerce model carrying the credit policy from
-[section 2](#a-policy-whose-rules-end-differently). A profile binds
+That call runs against a commerce model carrying the [credit policy worked
+through earlier](#a-credit-policy-worked-through). A profile binds
 `IssueCredit` to a `sql` executor, so kcmd performs the write itself, and the
 action's `guards` name the judged rule alone.
 
@@ -1125,8 +1163,8 @@ a judge settles no expression.
 asked.** An expression declaring `reject` or `escalate` refuses the action above
 and no model is reached; one declaring `warn` stands down, and the run reaches
 the judge and commits, with a warning line for the expression nothing checked.
-Three of the five guards
-[section 2](#a-policy-whose-rules-end-differently) puts on `IssueCredit` are
+Three of the five guards the
+[credit policy](#a-credit-policy-worked-through) puts on `IssueCredit` are
 expressions declaring `escalate` or `reject`, so the runs here guard on the
 judged rule alone — which is also why they load with the all-judged warning.
 
@@ -1294,7 +1332,7 @@ Model 'payments' (payments_eg), profile 'operational':
       Returns transferId, amount, debitedId. Every argument is an exact match
       and every one is optional; giving none returns the first rows. This tool
       cannot join, compare ranges, or total anything.
-      transferId: integer
+      transferId: string
       amount: number
       debitedId: integer
 
