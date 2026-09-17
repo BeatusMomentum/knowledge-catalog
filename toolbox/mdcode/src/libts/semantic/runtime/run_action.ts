@@ -52,11 +52,19 @@ import {
   fieldBinding,
   SemanticModel,
 } from '../ir';
+import {
+  bindScalar,
+  isParameterRequired,
+  sentence,
+  storeCodeFor,
+} from '../parameters';
 import {referencedParameters} from '../sql_identifiers';
 
 import {dialectFor, SqlDialect} from './dialect';
 import {Judge, JudgeVerdict} from './judge';
 import {runtimeClient, SemanticRuntime} from './runtime';
+
+export {bindScalar, isParameterRequired, sentence, storeCodeFor} from '../parameters';
 
 
 // An entity-typed argument, resolved to the row it denotes.
@@ -89,12 +97,14 @@ export type QueryFn = (stmt: spanner.Statement) =>
 
 // What the handler is given: the action, its arguments with entity-typed ones
 // already resolved, and a reader scoped to the open transaction (so a handler
-// can look at the pre-state before deciding what to write).
+// can look at the pre-state before deciding what to write). An optional
+// entity-typed parameter omitted by the caller has no entry in `refs`
+// (`refs[param.name]` is `undefined`).
 export interface ActionContext {
   model: SemanticModel;
   action: Action;
   args: Record<string, unknown>;
-  refs: Record<string, EntityRef>;
+  refs: Record<string, EntityRef|undefined>;
   query: QueryFn;
 }
 
@@ -149,13 +159,18 @@ export interface RunActionOptions {
 export async function runAction(opts: RunActionOptions):
     Promise<ActionOutcome> {
   const {model} = opts.runtime;
-  const args = opts.args;
   const action = (model.actions ?? []).find(a => a.name === opts.actionName);
   if (!action) {
     return {
       status: 'error',
       message: `Model '${model.name}' declares no action '${opts.actionName}'.`,
     };
+  }
+  const args: Record<string, unknown> = {...opts.args};
+  for (const param of action.parameters) {
+    if (args[param.name] === undefined && param.default !== undefined) {
+      args[param.name] = param.default;
+    }
   }
   // Decided BEFORE touching the store, so an action this runtime will not run
   // fails without having opened a transaction at all.
@@ -627,6 +642,13 @@ async function askJudges(
 }
 
 
+function entityKeyType(model: SemanticModel, entityName: string): string {
+  const entity = (model.entities ?? []).find(e => e.name === entityName);
+  const keyField = entity?.fields.find(f => f.name === (entity.keys ?? [])[0]);
+  return keyField?.type ?? 'String';
+}
+
+
 // Why the arguments cannot fill this call, or null if they can. Runs the same
 // checks `resolveArguments` and `bindArguments` run, early enough that nothing
 // has been opened or asked. `binds` is false when a handler supplies the
@@ -637,14 +659,17 @@ function argumentsNotUsable(
     null {
   for (const param of action.parameters) {
     const raw = args[param.name];
+    const required = isParameterRequired(param);
     if (param.isEntityRef) {
       if (raw === undefined || raw === null || `${raw}`.trim() === '') {
+        if (!required && (raw === undefined || raw === null)) continue;
         return `Action '${action.name}' requires '${param.name}', a ` +
             `reference to a ${param.type}, but none was given.`;
       }
       continue;
     }
     if (!binds) continue;
+    if (!required && (raw === undefined || raw === null)) continue;
     const bound = bindScalar(param, raw);
     if ('error' in bound) return bound.error;
   }
@@ -704,13 +729,6 @@ function unsettledGuards(model: SemanticModel, action: Action, judge?: Judge):
 }
 
 
-// Ends a fragment that is about to be followed by another sentence.
-function sentence(text: string): string {
-  const trimmed = text.trim();
-  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
-}
-
-
 function quoteList(names: readonly string[]): string {
   const quoted = names.map(n => `'${n}'`);
   if (quoted.length === 1) return quoted[0];
@@ -734,9 +752,19 @@ function bindArguments(
   const params: Record<string, unknown> = {};
   const types: Record<string, {code: string}> = {};
   for (const param of action.parameters) {
+    const required = isParameterRequired(param);
+    const raw = args[param.name];
+    if (!required && (raw === undefined || raw === null)) {
+      const targetType = param.isEntityRef ?
+          entityKeyType(model, param.type) :
+          param.type;
+      params[param.name] = null;
+      types[param.name] = {code: storeCodeFor(targetType)};
+      continue;
+    }
     const bound = param.isEntityRef ?
         bindReference(model, param, refs[param.name]) :
-        bindScalar(param, args[param.name]);
+        bindScalar(param, raw);
     if ('error' in bound) return {error: bound.error};
     params[param.name] = bound.value;
     types[param.name] = {code: bound.code};
@@ -761,111 +789,8 @@ function bindReference(
           `to a statement.`,
     };
   }
-  const entity = (model.entities ?? []).find(e => e.name === param.type);
-  const keyField = entity?.fields.find(f => f.name === (entity.keys ?? [])[0]);
   return bindScalar(
-      {name: param.name, type: keyField?.type ?? 'String'}, ref.keys[0]);
-}
-
-
-// One scalar argument as a Spanner value. The declared ontology type picks the
-// store type, so a `Decimal` amount is compared as a number rather than as text
-// -- which is the difference between "9" being less than "10" and not.
-// What Spanner accepts for a DATE and a TIMESTAMP parameter. The zone is
-// required rather than defaulted, because a timestamp written without one
-// means a different instant to every reader who supplies the missing part.
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-const RFC3339_TIMESTAMP =
-    /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[-+]\d{2}:?\d{2})$/;
-
-
-// Whether `text` is a day that exists, written the one way Spanner reads.
-// `Date.parse` answers neither question: it accepts '03/04/2026', and it reads
-// '2026-02-30' as the second of March rather than rejecting it. A round trip
-// answers both, because a day that rolled over comes back written differently.
-function isCalendarDay(text: string): boolean {
-  if (!ISO_DATE.test(text)) return false;
-  const utc = new Date(`${text}T00:00:00Z`);
-  return !Number.isNaN(utc.getTime()) && utc.toISOString().startsWith(text);
-}
-
-
-/**
- * One value, parsed to the store type its declared ontology type implies.
- *
- * Exported because a read has the same problem a write does: a filter on a
- * typed column has to be bound AS that type, or the predicate needs a cast and
- * no index can answer it. Sharing this also means one answer to what counts as
- * an Integer or a Date, rather than one for writes and another for reads.
- */
-export function bindScalar(param: ActionParameter, raw: unknown):
-    {value: unknown; code: string}|{error: string} {
-  // An empty String IS a value: `--arg memo=` is the caller saying the memo is
-  // blank, which is a different statement from not passing one. For every
-  // other type there is no value empty text could be, so it stays an error.
-  if (raw === undefined || raw === null ||
-      (`${raw}`.trim() === '' && param.type !== 'String')) {
-    return {
-      error: `Action parameter '${param.name}' (${param.type}) was not given ` +
-          `a value.`,
-    };
-  }
-  const text = `${raw}`.trim();
-  switch (param.type) {
-    case 'Integer':
-      if (!/^[-+]?\d+$/.test(text)) {
-        return {error: `'${param.name}' is an Integer, but '${text}' is not.`};
-      }
-      // INT64 travels as a string over the REST surface; a JSON number would
-      // lose precision above 2^53.
-      return {value: text, code: 'INT64'};
-    case 'Float':
-      if (!Number.isFinite(Number(text))) {
-        return {error: `'${param.name}' is a Float, but '${text}' is not.`};
-      }
-      return {value: Number(text), code: 'FLOAT64'};
-    case 'Decimal':
-      if (!/^[-+]?\d+(\.\d+)?$/.test(text)) {
-        return {error: `'${param.name}' is a Decimal, but '${text}' is not.`};
-      }
-      // NUMERIC travels as a string, for the same reason: an exact decimal
-      // routed through a JSON number stops being exact.
-      return {value: text, code: 'NUMERIC'};
-    case 'Boolean':
-      if (!/^(true|false)$/i.test(text)) {
-        return {error: `'${param.name}' is a Boolean, but '${text}' is not.`};
-      }
-      return {value: /^true$/i.test(text), code: 'BOOL'};
-    case 'Date':
-      // Spanner reads a DATE as YYYY-MM-DD and nothing else. '03/04/2026' is
-      // the fourth of March to one reader and the third of April to another,
-      // so the shape is checked -- and then the calendar, because a shape is
-      // not a day.
-      if (!isCalendarDay(text)) {
-        return {
-          error: `'${param.name}' is a Date, but '${
-              text}' is not one. Dates are written YYYY-MM-DD.`,
-        };
-      }
-      return {value: text, code: 'DATE'};
-    case 'DateTime':
-    case 'DateTimeTz':
-      if (!RFC3339_TIMESTAMP.test(text) || !isCalendarDay(text.slice(0, 10))) {
-        return {
-          error: `'${param.name}' is a ${param.type}, but '${
-              text}' is not a timestamp. Timestamps are written like ` +
-              `2026-03-04T10:00:00Z, with the zone.`,
-        };
-      }
-      return {value: text, code: 'TIMESTAMP'};
-    default:
-      // `raw`, not `text`. The trim above exists to parse a number or a date
-      // off a command line; a String parameter is not parsed, it IS the value.
-      // Trimming here would store `see ticket` for `--arg memo=" see ticket "`
-      // -- the caller's text altered on the way to the store, by a rule
-      // nothing states.
-      return {value: `${raw}`, code: 'STRING'};
-  }
+      {name: param.name, type: entityKeyType(model, param.type)}, ref.keys[0]);
 }
 
 
@@ -919,7 +844,9 @@ async function resolveArguments(
   for (const param of action.parameters) {
     if (!param.isEntityRef) continue;
     const raw = args[param.name];
+    const required = isParameterRequired(param);
     if (raw === undefined || raw === null || `${raw}`.trim() === '') {
+      if (!required && (raw === undefined || raw === null)) continue;
       return {
         error: `Action '${action.name}' requires '${param.name}', a reference ` +
             `to a ${param.type}, but none was given.`,
