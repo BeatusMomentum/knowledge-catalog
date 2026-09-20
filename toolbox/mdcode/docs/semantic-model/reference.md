@@ -117,9 +117,47 @@ one needs a store. That model is reported as offering none and the rest of the
 scope is still listed; the command exits non-zero. See
 [Hand it to an agent](actions.md#8-hand-it-to-an-agent).
 
+### skills-generate
+
+```bash
+kcmd skills-generate
+```
+
+Writes each model in the scope out as an [Agent Skill](https://agentskills.io/)
+folder: a `SKILL.md` naming the model, routing to its actions and saying what a
+call comes back as, and one `references/<action>.md` per action carrying that
+action's arguments, rules and blast radius. Reading the model is all this does --
+it touches no store, calls no judge, and runs nothing.
+
+A skill's `name` and the directory it sits in have to match, or a client skips
+it. So the directory is named from what was generated rather than from anything
+the caller typed, and a name the format does not allow fails before anything is
+written.
+
+Everything the binding decides lives in `SKILL.md`: the store, the executor
+kinds, which actions this deployment cannot run and why, and the `kcmd action
+run` line to try one with, all under one heading, plus the snippet for reading
+the store directly. A reference page is the same bytes under any profile.
+
+A guarded action is always described as runnable, because a rule stated in words
+is settled by the runtime before the transaction opens and a guarded action only
+ever runs against a runtime that has a judge. The command line printed for one
+says `--judge`. There is no flag here to say otherwise: whether the caller of
+`skills-generate` had a judge configured is a fact about that invocation, not
+about the deployment the document is read against.
+
 | Flag | Effect |
 |------|--------|
-| `--profile [name]` | Read the model under this binding profile. Defaults to `default_profile`, else the model's inline bindings. |
+| `--out <dir>` | Directory the skill directories are written under. Defaults to `skills`. |
+| `--name <name>` | Name the skill, and so its directory. Defaults to the model's own name. Rejected when the scope holds more than one model, because a name names one skill. |
+| `--profile [name]` | Read the model under this binding profile. Defaults to `default_profile`, else the model's inline bindings. It is what the one deployment-specific section describes. |
+| `--force` | Replace a skill already at that path. A reference page for an action the model no longer declares is deleted and reported; a file outside `references/` is left alone. |
+
+Before anything is written, a warning is printed when no action in a model is
+runnable under the selected profile, because a skill that can run nothing is
+rarely what was meant. Two models in one scope whose names normalize to one
+skill name are refused rather than one overwriting the other. See
+[Generating an Agent Skill](skills.md).
 
 ## What gets created in BigQuery
 
