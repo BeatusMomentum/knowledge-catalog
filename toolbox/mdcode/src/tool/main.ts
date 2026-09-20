@@ -207,6 +207,21 @@ try {
   process.exit(1);
 }
 
+// When cac serves `--help` or `--version` itself it prints and then calls
+// unsetMatchedCommand(), so a request that was answered arrives at the block
+// below looking exactly like a command that was never found. Take it as
+// handled: it has already printed, and asking for help is not an error.
+//
+// The cleared match is what makes it safe to exit here, so test for that
+// rather than for the flag. cac serves `--version` only when no command
+// matched; with one matched it runs the action instead and leaves the match
+// in place, and since every action is async, `cli.parse()` has returned while
+// the action is still pending at its first await. Exiting on the flag alone
+// would kill `kcmd push --version` mid-write and report success.
+if (!cli.matchedCommand && (cli.options.help || cli.options.version)) {
+  process.exit(0);
+}
+
 if (!cli.matchedCommand) {
   if (cli.args.length > 0) {
     console.error(`Error: Unknown command '${cli.args[0]}'`);
