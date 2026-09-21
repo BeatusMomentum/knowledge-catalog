@@ -867,42 +867,42 @@ describe('a guarded action is refused, not run unchecked', () => {
 
   test(
       'an action writing data a constraint reads runs, if it names no guard',
-       async () => {
-         // Credit affects Account and NonNegativeBalance reads Account.balance.
-         // That overlap is not what gives the rule effect over this call, and
-         // refusing on it would mean publishing a rule silently stopped calls
-         // that worked the day before -- the thing a constraint's reference
-         // rule exists to prevent.
-         const outcome = await runWith({constraints: [balance]});
-         if (outcome.status !== 'committed') throw new Error(outcome.message);
-       });
+      async () => {
+        // Credit affects Account and NonNegativeBalance reads Account.balance.
+        // That overlap is not what gives the rule effect over this call, and
+        // refusing on it would mean publishing a rule silently stopped calls
+        // that worked the day before -- the thing a constraint's reference
+        // rule exists to prevent.
+        const outcome = await runWith({constraints: [balance]});
+        if (outcome.status !== 'committed') throw new Error(outcome.message);
+      });
 
   test(
       'an action that declares no affects runs, constraints or not',
-       async () => {
-         // `affects` describes the blast radius; it is not a switch that turns
-         // checking on, and its absence is not a reason to refuse. The same
-         // DML runs either way, down to the row it inserts.
-         const outcome = await runWith({
-           actions: [{...credit, affects: undefined}],
-           constraints: [balance],
-         });
-         if (outcome.status !== 'committed') throw new Error(outcome.message);
-       });
+      async () => {
+        // `affects` describes the blast radius; it is not a switch that turns
+        // checking on, and its absence is not a reason to refuse. The same
+        // DML runs either way, down to the row it inserts.
+        const outcome = await runWith({
+          actions: [{...credit, affects: undefined}],
+          constraints: [balance],
+        });
+        if (outcome.status !== 'committed') throw new Error(outcome.message);
+      });
 
   test(
       'a guard is refused even when the model states no such constraint',
-       async () => {
-         // An unresolved guard fails the push, so this model should not exist.
-         // If one reaches the runtime anyway, the action still claims to be
-         // checked, and running it would still be running it unchecked.
-         const outcome = await runWith({
-           actions: [{...credit, guards: ['NoSuchRule']}],
-           constraints: [],
-         });
-         if (outcome.status !== 'error') throw new Error('expected an error');
+      async () => {
+        // An unresolved guard fails the push, so this model should not exist.
+        // If one reaches the runtime anyway, the action still claims to be
+        // checked, and running it would still be running it unchecked.
+        const outcome = await runWith({
+          actions: [{...credit, guards: ['NoSuchRule']}],
+          constraints: [],
+        });
+        if (outcome.status !== 'error') throw new Error('expected an error');
         expect(outcome.message).toContain('guarded by \'NoSuchRule\'');
-       });
+      });
 
   test('several guards are all named', async () => {
     const outcome = await runWith({
@@ -995,14 +995,14 @@ describe('a guard settled by judgment', () => {
 
   test(
       'the judge is given the arguments as the caller stated them',
-       async () => {
-         // Before resolution, which is the point of asking here: 'A1' is what
-         // the caller said, and the key it resolves to would tell a judge
-         // nothing.
-         const judge = holds();
-         await runWith([justified], judge);
-         expect(judge.asked[0].arguments).toEqual({account: 'A1', amount: 100});
-       });
+      async () => {
+        // Before resolution, which is the point of asking here: 'A1' is what
+        // the caller said, and the key it resolves to would tell a judge
+        // nothing.
+        const judge = holds();
+        await runWith([justified], judge);
+        expect(judge.asked[0].arguments).toEqual({account: 'A1', amount: 100});
+      });
 
   test(
       'a verdict that does not hold refuses before anything opens',
@@ -1021,18 +1021,18 @@ describe('a guard settled by judgment', () => {
 
   test(
       'the refusal carries the author words and the judge reason', async () => {
-         const outcome = await runWith([justified], doesNot());
-         if (outcome.status !== 'error') throw new Error('expected an error');
+        const outcome = await runWith([justified], doesNot());
+        if (outcome.status !== 'error') throw new Error('expected an error');
         expect(outcome.message).toContain('\'CreditIsJustified\'');
-         expect(outcome.message)
-             .toContain('The memo must name a specific service failure.');
-         expect(outcome.message).toContain('A credit needs a stated reason.');
+        expect(outcome.message)
+            .toContain('The memo must name a specific service failure.');
+        expect(outcome.message).toContain('A credit needs a stated reason.');
         expect(outcome.message).toContain('The memo names no service failure.');
-         // A caller told a transaction rolled back goes looking for a write
-         // that never reached the store.
-         expect(outcome.message).toContain('No transaction was opened');
-         expect(outcome.message).not.toContain('rolled back');
-       });
+        // A caller told a transaction rolled back goes looking for a write
+        // that never reached the store.
+        expect(outcome.message).toContain('No transaction was opened');
+        expect(outcome.message).not.toContain('rolled back');
+      });
 
   test('an escalation says an approver may allow it', async () => {
     // `escalate` states that an approver exists. Nothing here is one, and a
@@ -1134,33 +1134,33 @@ describe('a guard settled by judgment', () => {
 
   test(
       'a judgment with no words refuses rather than asking about nothing',
-       async () => {
-         // An empty rule put to a judge comes back "not enough to tell", so
-         // every call would be refused and the citation could not quote what
-         // was broken.
-         const judge = holds();
-         const blank: Constraint = {...justified, judgment: '   '};
-         const outcome = await runWith([blank], judge);
-         if (outcome.status !== 'error') throw new Error('expected an error');
-         expect(judge.asked).toHaveLength(0);
-         expect(outcome.message).toContain('CreditIsJustified');
-         expect(outcome.message)
-             .toContain(
+      async () => {
+        // An empty rule put to a judge comes back "not enough to tell", so
+        // every call would be refused and the citation could not quote what
+        // was broken.
+        const judge = holds();
+        const blank: Constraint = {...justified, judgment: '   '};
+        const outcome = await runWith([blank], judge);
+        if (outcome.status !== 'error') throw new Error('expected an error');
+        expect(judge.asked).toHaveLength(0);
+        expect(outcome.message).toContain('CreditIsJustified');
+        expect(outcome.message)
+            .toContain(
                 `'CreditIsJustified', which states no rule to put to a judge.`);
-       });
+      });
 
   test(
       'an advisory judgment with no words is reported, never asked',
-       async () => {
-         // An advisory guard is never refused, so this is the one path on
-         // which an empty rule could still have reached a judge.
-         const judge = holds();
-         const blank: Constraint = {...advisory, judgment: ''};
-         const outcome = await runWith([blank], judge);
-         if (outcome.status !== 'committed') throw new Error(outcome.message);
-         expect(judge.asked).toHaveLength(0);
-         expect(outcome.warnings?.[0]).toContain('states no words');
-       });
+      async () => {
+        // An advisory guard is never refused, so this is the one path on
+        // which an empty rule could still have reached a judge.
+        const judge = holds();
+        const blank: Constraint = {...advisory, judgment: ''};
+        const outcome = await runWith([blank], judge);
+        if (outcome.status !== 'committed') throw new Error(outcome.message);
+        expect(judge.asked).toHaveLength(0);
+        expect(outcome.warnings?.[0]).toContain('states no words');
+      });
 
   test('a verdict missing its answer is reported, not thrown', async () => {
     // `Judge` is a seam a caller implements, so a verdict can arrive without
@@ -1176,13 +1176,13 @@ describe('a guard settled by judgment', () => {
 
   test(
       'a verdict that does not hold and states no reason still refuses',
-       async () => {
-         const terse = new ScriptedJudge(
-             {holds: false, reason: undefined as unknown as string});
-         const outcome = await runWith([justified], terse);
-         if (outcome.status !== 'error') throw new Error('expected an error');
-         expect(outcome.message).toContain('does not hold for this call');
-       });
+      async () => {
+        const terse = new ScriptedJudge(
+            {holds: false, reason: undefined as unknown as string});
+        const outcome = await runWith([justified], terse);
+        if (outcome.status !== 'error') throw new Error('expected an error');
+        expect(outcome.message).toContain('does not hold for this call');
+      });
 
   test(
       'an advisory guard nobody could ask about is reported, not dropped',
@@ -1201,16 +1201,16 @@ describe('a guard settled by judgment', () => {
 
   test(
       'a guard stating no rule is refused whatever judge is given',
-       async () => {
+      async () => {
         // Supplying a judge does not give a bodyless constraint something to
         // put to it, and a message about a missing judge would send a caller
         // who already supplied one the wrong way.
-         const outcome = await runWith(
+        const outcome = await runWith(
             [{name: 'UnderCeiling', onViolation: 'reject'}], holds());
-         if (outcome.status !== 'error') throw new Error('expected an error');
+        if (outcome.status !== 'error') throw new Error('expected an error');
         expect(outcome.message).toContain('states no rule to put to a judge');
         expect(outcome.message).not.toContain('was given no judge to ask');
-       });
+      });
 
   test('what a run does and what a tool advertises agree', async () => {
     // agent_tools.ts asks this before offering the action. A tool advertised
@@ -1222,6 +1222,92 @@ describe('a guard settled by judgment', () => {
         .toContain('no judge to ask');
     expect(whyRefusedWithoutRunning(guarded, action, undefined, holds()))
         .toBeNull();
+  });
+
+  test('skipGuards clears the refusal for want of a judge', async () => {
+    // What the caller is saying is that nobody will be asked. A guarded action
+    // is otherwise unrunnable without a judge, and that refusal is total, so
+    // an author with no judge configured could not exercise their own write at
+    // all without deleting the guard -- which loses the guard and tests a
+    // different model.
+    const judged = guarding([justified]);
+    expect(whyRefusedWithoutRunning(judged, judged.actions![0]))
+        .toContain('no judge to ask');
+    expect(whyRefusedWithoutRunning(
+               judged, judged.actions![0], undefined, undefined, true))
+        .toBeNull();
+  });
+
+  test(
+      'skipGuards names every guard it passed over, on the outcome',
+      async () => {
+        // One line for the whole skip rather than one per rule, since they went
+        // unchecked for one reason -- but a line, not silence. This used to
+        // return no warnings at all, on the reasoning that the caller asking
+        // for the skip already knew. The caller is not the only reader:
+        // `describeOutcome` hands these warnings to an agent as a tool's own
+        // answer, and an agent told only `applied: true` has been told the
+        // write met every rule the model states.
+        const fake = fakeStore();
+        const outcome = await act({
+          model: guarding([advisory]),
+          actionName: 'Credit',
+          args: {account: 'A1', amount: 100},
+          client: fake.client,
+          skipGuards: true,
+        });
+        if (outcome.status !== 'committed') throw new Error(outcome.message);
+        expect(fake.committed).toBe(true);
+        expect(outcome.warnings ?? []).toHaveLength(1);
+        expect((outcome.warnings ?? [])[0])
+            .toContain('guards were not checked: CreditIsJustified');
+        expect((outcome.warnings ?? [])[0])
+            .toContain('the write was made anyway');
+      });
+
+  test('skipGuards asks no judge, even when one is handed over', async () => {
+    // `skipGuards` means nobody is asked. A caller that passed both used to
+    // reach the judge anyway while the unsettled-guard warnings stayed
+    // suppressed -- the worst of both, since a judge that threw or returned
+    // nothing then committed with no line about it anywhere.
+    const fake = fakeStore();
+    let asked = 0;
+    const outcome = await act({
+      model: guarding([justified]),
+      actionName: 'Credit',
+      args: {account: 'A1', amount: 100},
+      client: fake.client,
+      skipGuards: true,
+      judge: {
+        name: 'a judge nobody should reach',
+        decide: async () => {
+          asked++;
+          return {holds: false, reason: 'refused'};
+        },
+      },
+    });
+    expect(asked).toBe(0);
+    if (outcome.status !== 'committed') throw new Error(outcome.message);
+    expect(fake.committed).toBe(true);
+  });
+
+  test('skipGuards does not clear a guard that names nothing', async () => {
+    // Not checking the guards is not the same as not reading them. A guard
+    // naming a rule the model never declares is the model being wrong about
+    // itself -- a push refuses it on the same grounds -- and it refuses with a
+    // judge in hand, so standing the judge down was never what was wrong. The
+    // write it would apply is one the author believes is gated by something
+    // that does not exist, and the repair is a spelling, not a flag.
+    const undeclared = creditModel({
+      actions: [{...credit, guards: ['NoSuchRule']}],
+      constraints: [],
+    });
+    const action = undeclared.actions![0];
+    expect(whyRefusedWithoutRunning(undeclared, action, undefined, holds()))
+        .toContain('not declared');
+    expect(whyRefusedWithoutRunning(
+               undeclared, action, undefined, undefined, true))
+        .toContain('not declared');
   });
 });
 
@@ -1448,7 +1534,7 @@ describe('a constraint that only warns', () => {
   test(
       'but a guard naming nothing the model declares still refuses',
       async () => {
-        // Validation makes that a hard error and `kcmd action run` now runs
+        // Validation makes that a hard error and `kcmd action-run` now runs
         // validation -- but a library caller reaching runAction directly gets
         // no such pass, and a guard this cannot account for is not something
         // to wave through on the grounds that it was not found.
@@ -1554,16 +1640,16 @@ describe('a date or a timestamp argument', () => {
 
   test(
       'a date in some other order is refused, naming the parameter',
-       async () => {
-         // '03/04/2026' is the fourth of March to one reader and the third of
-         // April to another, so it is not a date this can accept.
-         const {fake, outcome} = scheduling({day: '03/04/2026'});
-         const result = await outcome;
-         if (result.status !== 'error') throw new Error('expected an error');
+      async () => {
+        // '03/04/2026' is the fourth of March to one reader and the third of
+        // April to another, so it is not a date this can accept.
+        const {fake, outcome} = scheduling({day: '03/04/2026'});
+        const result = await outcome;
+        if (result.status !== 'error') throw new Error('expected an error');
         expect(result.message).toContain('\'day\' is a Date');
-         expect(result.message).toContain('YYYY-MM-DD');
-         expect(fake.committed).toBe(false);
-       });
+        expect(result.message).toContain('YYYY-MM-DD');
+        expect(fake.committed).toBe(false);
+      });
 
   test('a date with the right shape and no such day is refused', async () => {
     const {outcome} = scheduling({day: '2026-02-30'});
