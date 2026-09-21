@@ -1,98 +1,124 @@
 # Generating an Agent Skill
 
-An **Agent Skill** is a folder an AI agent loads by itself. It holds a `SKILL.md`
-— YAML frontmatter naming the skill, then Markdown telling the agent how to do
-something — plus any files that Markdown points at. The format is published at
-[agentskills.io](https://agentskills.io/) and is read by Claude Code, Cursor,
-Gemini CLI and others, so a skill is the portable way to hand an agent a
-capability without writing an adapter for each client.
+`kcmd skills-generate` compiles a semantic model in the current catalog scope
+into an [Agent Skills](https://agentskills.io) package: a directory containing
+`SKILL.md` and one `references/<action>.md` page per declared action.
 
-Clients load skills in stages. Every skill's frontmatter is in the agent's
-context from the start, which is how it decides a skill is relevant; the body is
-read only once it has decided; files the body names are read only if the agent
-opens them. That staging is a budget: keep a body under 500 lines and about
-5,000 tokens, and put the rest in files beside it.
+Point `--out` at the skills directory Gemini CLI scans (`.gemini/skills` or
+`.agents/skills`), and the agent receives the model's action index, business
+rules, physical table/column mappings for looking up keys, and execution
+coordinates for the selected binding profile.
 
-`kcmd skills-generate` writes a semantic model out in that form. You get a skill
-per model, describing the writes the model declares:
+## How progressive disclosure works
 
-```
-skills/
-└── commerce/
-    ├── SKILL.md
-    └── references/
-        └── issue-credit.md
-```
+An Agent Skill separates discovery, routing, and per-action detail so a model
+with thirty actions costs the same at startup as a model with one:
 
-`SKILL.md` is a router — what the business is, one row per action, and the
-handful of things true of every call. Each action's arguments, the rules that
-gate it and what it changes go in its own reference page, which the agent reads
-only when it has picked that action. A model with thirty actions costs the same
-at startup as a model with one.
+1. **Discovery (YAML frontmatter)**: Loaded at session startup (~100 tokens).
+   `name` (`<= 64` characters) and `description` (`<= 1,024` characters) tell
+   the harness what data the model covers, which actions it declares, and to
+   activate the skill when a request asks to change data rather than only read
+   it.
+2. **Routing (`SKILL.md` body)**: Loaded when the skill activates. Gives the
+   agent a one-line-per-action router table (`## What you can do here`),
+   model-wide instructions (`## How this model wants to be used`), how to look
+   up record keys and the physical table/column map (`## Finding a record`), the
+   active profile's store and executor coordinates (`## Running an action`), and
+   how pre-commit guard evaluation works (`## What happens when you call one`).
+3. **Execution (`references/<action>.md`)**: Read on demand only when the agent
+   chooses an action from the router table. Contains that action's arguments,
+   caller instructions, gating business rules (`guards`), and blast radius
+   (`affects`).
 
-## Generate one
+Keeping per-action contracts in `references/<action>.md` keeps `SKILL.md` well
+inside the Agent Skills 500-line / 5,000-token body budget. If
+`model.ai_context.instructions` or a very large schema pushes `SKILL.md` past
+those limits, `kcmd skills-generate` warns
+(`SKILL.md body is <N> lines, over the 500-line guidance. Move detail into references/.`
+or
+`SKILL.md body is roughly <N> tokens, over the 5000-token guidance. Move detail into references/.`).
 
-Run it in a semantic-model scope, the same directory `kcmd push` and
-`kcmd profiles` work in:
+## Quickstart and CLI options
+
+`kcmd skills-generate` reads the catalog scope (`catalog.yaml` and its
+`EntryGroups/`) in the **current working directory**. Change into a catalog
+directory first, then run `kcmd skills-generate`:
 
 ```bash
-kcmd skills-generate --out skills
+cd demo/semantic-model/skill
+kcmd skills-generate --profile spanner --out .gemini/skills --force
 ```
 
-```
-Wrote skills/commerce/SKILL.md
-Wrote skills/commerce/references/issue-credit.md
-```
+This writes two files:
 
-| Flag | What it does |
-|---|---|
-| `--out <dir>` | Directory the skill directories go under. Defaults to `skills` |
-| `--name <name>` | Names the skill, and so its directory. Defaults to the model's name. Only for a scope with one model |
-| `--profile [name]` | Read the model under this binding profile — it's what the one deployment-specific section describes |
-| `--force` | Replace a skill that's already there |
-
-A skill directory already on disk isn't written into without `--force`. What's
-generated is a starting point you're meant to read and may have edited, and a
-regeneration that silently replaced those edits would lose work every time the
-model changed.
-
-`--force` replaces rather than layers. Renaming an action changes the filename of
-its reference page, and the page under the old name is deleted rather than left
-behind — staged loading means an agent opens a file under `references/` because
-the router pointed at it, but a page nobody points at is still a page it can
-read, describing a call the runtime no longer has. Files outside `references/`
-stay where they are; a Markdown file under `references/` that the run didn't
-write is removed.
-
-Generating a skill that can't run anything is allowed and said out loud. The
-description is still true and the actions are still described, so the document
-is worth having — but it isn't usually what you meant to generate. Two bindings
-get you there: a profile that binds no store, and an action whose executor the
-runtime won't wrap because it couldn't roll the write back. Either way you get
-`Warning: [<model>] No action in '<model>' is runnable under profile
-'<profile>', so the skill describes N actions and can run none of them.
-"Running an action" in the skill gives the reason for each.`
-
-The warning comes before anything is written, so a reader who didn't mean this
-still has the chance not to keep it.
-
-The skill's name and its directory name have to match — a client that finds them
-different skips the skill, and a plugin wrapping it is required to. So the
-generator names the directory from the same string it writes into the
-frontmatter, and rejects a name the format doesn't allow before writing
-anything:
-
-```
-$ kcmd skills-generate --name Commerce_Demo
-Error: [commerce] skill name 'Commerce_Demo' is not valid: use lowercase
-letters, digits and single hyphens, starting and ending with a letter or a
-digit.
+```text
+Wrote .gemini/skills/commerce/SKILL.md
+Wrote .gemini/skills/commerce/references/issue-credit.md
 ```
 
-## What lands in SKILL.md
+### Flags
 
-Frontmatter carries the two fields the format requires and nothing else — the
-field set is closed, and a seventh key fails validation:
+All flags are optional:
+
+| Flag | Default | What it does |
+| :--- | :--- | :--- |
+| `--out <dir>` | `skills` | Parent directory where `<skill-name>/` is written (`<out>/<skill-name>/SKILL.md` and `<out>/<skill-name>/references/*.md`). |
+| `--profile <name>` | `default_profile` from `catalog.yaml` | Binding profile from `<model>.profiles/<name>.yaml` used to resolve the physical store, table/column mappings, and action executors. |
+| `--name <name>` | Derived from `model.name` | Override the generated skill name (and directory name `<out>/<name>`). Must match `^[a-z0-9]+(-[a-z0-9]+)*$` (lowercase letters, digits, and single hyphens between words, starting and ending with a letter or a digit, max 64 characters). |
+| `--force` | `false` | Overwrite an existing `<out>/<skill-name>/` directory and remove any stale `.md` files in `<out>/<skill-name>/references/` left over from renamed or deleted actions. Without `--force`, an existing target directory is refused with `Error: <dir> already exists. Pass --force to rewrite it.` |
+
+If `--name` is not valid, `kcmd skills-generate` refuses before writing any
+file:
+
+```text
+Error: [commerce] skill name 'Commerce_Demo' is not valid: use lowercase letters, digits and single hyphens, starting and ending with a letter or a digit.
+```
+
+If no action in the model is runnable under the selected profile, the skill is
+still written so its reference pages can be inspected, and
+`kcmd skills-generate` prints a warning to `stderr`:
+
+```text
+Warning: [commerce] No action in 'commerce' is runnable under profile 'spanner', so the skill describes 1 action and can run none of them. "Running an action" in the skill gives the reason for each.
+```
+
+### Where Gemini CLI discovers skills
+
+Pass one of the following paths to `--out` so Gemini CLI discovers
+`<out>/<skill-name>/SKILL.md` automatically:
+
+| Scope | `--out` directory |
+| :--- | :--- |
+| **Project / workspace scope** | `.gemini/skills` or `.agents/skills` |
+| **User scope** | `~/.gemini/skills` or `~/.agents/skills` |
+
+## How the model maps to the generated files
+
+```text
+SemanticModel + Binding Profile
+│
+├── SKILL.md
+│   ├── Frontmatter (name, description)     <── model.name, model.description, actions[].name
+│   ├── ## What you can do here             <── actions[].name, actions[].description
+│   ├── ## How this model wants to be used  <── model.ai_context.instructions + tool-contract rules
+│   ├── ## Finding a record                 <── profile store + entities[].fields (table & column map)
+│   ├── ## Running an action                <── active profile, store, actions[].executor
+│   └── ## What happens when you call one   <── pre-commit guard & transaction outcome contract
+│
+└── references/<action>.md (one per action, profile-independent)
+    ├── Heading & tool name                 <── action.name (and snake_case tool name)
+    ├── ## Arguments                        <── action.parameters
+    ├── ## How to call it                   <── action.ai_context.instructions
+    ├── ## Rules that apply to this call    <── action.guards resolved against model.constraints
+    └── ## What it changes                  <── action.affects (concept, operation, fields)
+```
+
+## Inside `SKILL.md`
+
+Every snippet below comes directly from running
+`kcmd skills-generate --profile spanner` in `demo/semantic-model/skill`.
+
+### Frontmatter (`name` and `description`)
 
 ```yaml
 ---
@@ -101,93 +127,223 @@ description: "Customers, their orders, and the lines that make up an order. Decl
 ---
 ```
 
-Both values are quoted. A model named `no`, `on` or `y` is a plain YAML 1.1
-boolean and one named `2024` is an integer, and most YAML parsers outside
-JavaScript still read 1.1 — so an unquoted name reaches a client as something
-that isn't a string and no longer matches the directory.
+- **`name`**: Derived from `model.name` by converting `CamelCase` and
+  `snake_case` to lowercase `kebab-case` (or overridden with `--name`). Always
+  quoted in YAML frontmatter so names like `on` or `no` are never parsed as
+  booleans by YAML 1.1 loaders.
+- **`description`**: Built from the first sentence of `model.description`, the
+  count and names of declared actions, and the routing sentence
+  (`Use when a request asks to change this data rather than only read it.`). If
+  a model declares so many actions that the list would exceed the
+  1,024-character limit, the action names are abridged
+  (`Declares 60 actions: Act1, Act2, and 48 more.`) while keeping the routing
+  sentence intact.
 
-The description is written so the part a client routes on survives: the action
-names and the sentence saying when to reach for the skill are composed first, and
-a model description too long to fit alongside them is cut down to what's left of
-the 1,024 characters the format allows.
+### `## What you can do here`
 
-Then the model's description, a table of actions, and the model's own
-`ai_context.instructions` — what the business wants said to any agent acting on
-it, which lives in the model rather than in whoever wrote the agent:
+Lists one row per action and points the agent to its reference page in
+`references/`:
 
 ```markdown
 | Action | What it does | Reference |
 | --- | --- | --- |
-| `IssueCredit` | Credit a customer against one order -- a late delivery, a coupon, a … | `references/issue-credit.md` |
+| `IssueCredit` | Credit a customer against one order -- a late delivery, a coupon, a shipping charge applied in error. The credit is added as a negative line and the order total is recomputed from the lines. | `references/issue-credit.md` |
 ```
 
-The row names the action the way it was authored, because that's the string a
-refusal quotes back. The snake_case tool name a framework would register it under
-is on the reference page, stated once.
+If a model declares no actions, the router table is replaced by:
 
-Then **Finding a record**, which exists because a skill of writes has a hole in
-it: a request names a person and a day, and an action wants a key. The section
-says where the key can come from — the caller, or a read — and says what a wrong
-key costs, which is the call rather than the data: a statement that writes no
-rows fails the action and rolls the transaction back, so a guess is safe to be
-wrong about and unsafe to be right about by accident. Then, for a Spanner store,
-it gives the `gcloud` line that reads the database, followed by the tables to
-write a `SELECT` against:
-
+```text
+This model declares no actions, so there is nothing here to call. It describes what commerce means; it does not offer a way to change it.
 ```
+
+Only `SKILL.md` is written in that case — no `references/` directory is created
+— and `kcmd skills-generate` warns:
+
+```text
+Warning: [commerce] Model 'commerce' declares no actions, so the skill describes nothing an agent can do. Generated anyway.
+```
+
+This is a different warning from the no-runnable-action one above: that one
+fires when actions exist but none can run, this one when the model declares none
+at all.
+
+### `## How this model wants to be used`
+
+Starts with `ai_context.instructions` from the model (if provided), followed by
+the standard contract for identifiers, guards, and warnings:
+
+```markdown
+Never invent an identifier. When you are given a name or a description where an action wants a key, ask the caller or read the store directly. Check every rule that gates an action before running it: when a rule says a write must not happen, refuse and explain why; when it says a person has to decide, say so and stop, because you cannot approve it yourself; when an advisory rule goes unmet, report both the change and the warning. Finish by saying what you changed.
+```
+
+### `## Finding a record`
+
+Actions take keys (`order_id`, `customer_id`), whereas users typically refer to
+records by name or date. Without a schema map in `SKILL.md`, an agent given a
+database command spends its first turns querying `INFORMATION_SCHEMA`—and if the
+map does not explicitly distinguish physical column names from logical model
+names, an agent writes `o.customerId` in SQL, hits a column-not-found error, and
+falls back to `INFORMATION_SCHEMA` anyway.
+
+When the active profile binds a store, `## Finding a record` gives the agent
+both the read entry point and the physical schema map:
+
+1. **Read command / connection guidance**:
+   - **Spanner (`store.kind === 'spanner'`)**: Emits
+     `gcloud spanner databases execute-sql <database> --instance=<instance> --project=<project> --sql='SELECT ...'`.
+   - **BigQuery (`store.kind === 'bigquery'`)**: Emits
+     `bq query --use_legacy_sql=false --project_id=<project> --dataset_id=<dataset> 'SELECT ...'`.
+   - **AlloyDB (`store.kind === 'alloydb'`)**: States that the skill supplies no
+     canned CLI command and names
+     `<project>/<location>/<cluster>/<instance>/<database>` for connection via
+     `psql` or the AlloyDB Auth Proxy.
+2. **Physical table and column map**: Lists every bound entity's physical table
+   name and columns in the store's SQL dialect (`GoogleSQL` for Spanner and
+   BigQuery, `PostgreSQL` with quoted identifiers for AlloyDB), labelling each
+   physical column `column` and following it with `= Entity.field` and the
+   field's description:
+
+```text
 Customer -> table Customer
   column customer_id (Integer) = Customer.customerId
   column name (String) = Customer.name. The customer's display name, e.g. "Morgan Ellis".
   column email (String) = Customer.email
 Order -> table Orders
   column order_id (Integer) = Order.orderId. The order's number, which is how both the customer and the desk refer to it.
+  column customer_id (Integer) = Order.customerId
   column placed_on (Date) = Order.placedOn. The day the order was placed.
   column total (Decimal) = Order.total. What the customer owes on this order, in dollars.
+  column status (String) = Order.status. OPEN or CLOSED.
+LineItem -> table LineItem
+  column line_item_id (String) = LineItem.lineItemId
+  column order_id (Integer) = LineItem.orderId
+  column type (String) = LineItem.type. item, tax, fee, or credit.
+  column amount (Decimal) = LineItem.amount
+  column memo (String) = LineItem.memo
 ```
 
-Both names appear, and which is which is spelled out rather than implied. The
-rest of the skill is written in the model's names and a statement has to contain
-the store's, so an agent reading this has to cross between them — and a rendering
-that only paired them up, `customer_id is Customer.customerId`, got read
-backwards: an agent wrote `o.customerId`, got a name-not-found error, and fell
-back to `INFORMATION_SCHEMA`. So the physical one is labelled `column` and the
-sentence above the block says the quoted name is the one to write.
+### `## Running an action`
 
-The field descriptions come along because a coded column's own description
-carries what its values are — `item, tax, fee, or credit` — and an agent that has
-to guess them filters on a value the column never holds and gets an empty answer
-back, which reads like the record not existing.
+This is the only section in the skill package that describes the deployment
+binding rather than the logical model:
 
-Last comes what the runtime guarantees, which is the same for every model. Every
-rule is settled before the write opens a transaction, so a refusal leaves the
-store exactly as it was; and a call comes back in one of three states rather
-than two — applied, refused, or an outcome nothing can establish. An agent that
-reads a refusal as something to retry, or a warning on a successful write as
-nothing, gets it wrong the same way against every model, so every skill says it.
+- **Store**: `<project>/<instance>/<database>` for Spanner,
+  `alloydb:<project>/<location>/<cluster>/<instance>/<database>` for AlloyDB,
+  `bigquery:<project>/<dataset>` for BigQuery. When the profile binds no store
+  the line is `- Store: none.` followed by the reason, for example `- Store:
+  none. Model 'commerce' declares no deployment target under this profile, so
+  there is no store to run against. Select a profile whose deployment target
+  names a database.`
+- **Executor**: The executor kind(s) (`sql`, `mcp`, `rest`, or `grpc`) across
+  every action the model *declares*, not only the runnable ones. It is a summary
+  of the binding, not a runnability signal: a profile in which nothing can run
+  still prints `` - Executor: `sql` `` above the list of reasons why.
+- **Remote executor coordinates**: When an action uses a remote executor, its
+  target coordinates are printed directly under `Executor`:
+  - `mcp`: ``- `PlaceOrder` (`place_order`): MCP tool `place_order` on
+    `//agentregistry.googleapis.com/...` ``
+  - `rest`: ``- `PlaceOrder` (`place_order`): HTTP `POST`
+    `https://api.acme.example/v1/orders` ``
+  - `grpc`: ``- `PlaceOrder` (`place_order`): gRPC
+    `acme.orders.v1.OrderService/PlaceOrder` ``
+- **Guard evaluation**: Whether an action's guards are settled is a property of
+  the model, not a `--judge` flag on `skills-generate`. An agent framework that
+  exposes these actions as tools puts the action's guards to a judge before
+  opening a transaction, and refuses rather than writing unchecked when it
+  cannot settle one the model requires.
+- **Unrunnable actions (`Not runnable under this profile`)**: An action is
+  marked not runnable in `SKILL.md` (while keeping its `references/<action>.md`
+  page intact) only when:
+  1. It has no executor under the active profile (`executor` omitted or
+     withdrawn with `executor: null`).
+  2. Its executor is `sql` and the profile binds no operational store (`spanner`
+     or `alloydb`).
+  3. It names a non-advisory guard that is not declared in `model.constraints`
+     or has no `judgment` text.
 
-## What lands in a reference page
+### `## What happens when you call one`
 
-Everything an agent needs before it calls one action: the arguments with their
-types, the guidance the action carries, the rules, and the blast radius.
+States the execution and outcome rules:
+- Every guard is evaluated **before** opening a write transaction, so a refusal
+  leaves the store untouched.
+- Every call returns one of three states: **Applied**, **Refused** (repeat the
+  reason plainly; if a supervisor must decide, stop rather than rephrasing the
+  request to get past the rule), or **Unknown** (the commit could not report its
+  outcome; do not blindly retry).
+- If a call comes back **Applied** alongside advisory warnings, the agent must
+  report both the applied change and the warnings.
 
-The rules are the part worth looking at. Each one arrives with its own words and
-its consequence, and an advisory rule — one whose `on_violation` is `warn` —
-is listed and marked as advisory rather than dropped:
+## Inside `references/<action>.md`
+
+Each action in `model.actions` generates one file in `references/<slug>.md`.
+Reference pages contain **only logical model facts**—no table names, column
+names, SQL statements, or store coordinates ever appear on a reference page.
+
+### Heading and tool name
 
 ```markdown
+# IssueCredit
+
+Action `IssueCredit` of the `commerce` model. As a tool it is named `issue_credit`.
+```
+
+When `action.name` differs from its `snake_case` tool name, both are named on
+the first line so the agent can match either spelling.
+
+### `## Arguments`
+
+Built from `action.parameters`. A parameter projected from an entity or
+relationship field (`{concept: Order, field: orderId}`) inherits that field's
+scalar type and description unless overridden on the parameter; a standalone
+parameter (`{name: memo, type: String}`) uses its own `type`, `required`,
+`default`, and `description`:
+
+```markdown
+| Name | Type | Required | What to pass |
+| --- | --- | --- | --- |
+| `order` | integer | yes | The order's number, which is how both the customer and the desk refer to it. |
+| `amount` | number | yes | The amount, as a decimal number. |
+| `memo` | string | yes | The memo, as text. |
+```
+
+If any parameter declares a `default`, a `Default` column is included between
+`Required` and `What to pass`.
+
+### `## How to call it`
+
+Emitted when `action.ai_context.instructions` is present on the action, giving
+call-specific instructions (for example, what details must be included in a
+`memo` argument so a judged guard can evaluate it).
+
+### `## Rules that apply to this call`
+
+Lists every constraint named in `action.guards`, resolved against
+`model.constraints`. Each constraint prints its `on_violation` policy (`reject`,
+`escalate`, or `warn`), its `judgment` text as a blockquote, and its
+`description` under `If it does not hold:`:
+
+```markdown
+### CreditUnderReviewThreshold
+
+On violation: `escalate`
+
+> The credit amount requested must not exceed 25 dollars, which is the self-service ceiling for this desk. Read the amount as dollars.
+
+If it does not hold: A credit over $25 is above the self-service ceiling. A supervisor decides it.
+
 ### CreditMemoNamesAServiceFailure (advisory)
 
 On violation: `warn` -- this one reports and lets the write through.
 
-> The memo argument of this call must name a specific thing that went wrong on
-> the order: a late delivery, a damaged item, a shipping charge applied in
-> error. …
+> The memo argument of this call must name a specific thing that went wrong on the order: a late delivery, a damaged item, a shipping charge applied in error. A memo saying only that the customer asked, or that the credit is goodwill, or giving no reason at all, names no failure and does not satisfy this rule.
 
-If it does not hold: Say in the credit memo what actually went wrong with the
-order.
+If it does not hold: Say in the credit memo what actually went wrong with the order.
 ```
 
-And what the call reaches, from the action's `affects`:
+### `## What it changes`
+
+Renders `action.affects` as a table showing which concepts and fields the action
+creates, modifies, or deletes:
 
 ```markdown
 | Concept | Operation | Fields |
@@ -196,109 +352,93 @@ And what the call reaches, from the action's `affects`:
 | `Order` | `modify` | `total` |
 ```
 
-An action the runtime can't run under this binding is still written out, in
-full. Its page doesn't mention it, though. Whether a call can run here is a fact
-about the deployment wearing a logical name, so it's collected with the rest of
-them in `SKILL.md`, where it can also say which rules the action is waiting on.
+## Switching binding profiles (`--profile`)
 
-## The deployment stays out of the reference pages
+When a model has multiple binding profiles (such as
+`commerce.profiles/spanner.yaml` and `commerce.profiles/alloydb.yaml` in
+`demo/semantic-model/skill`), running `kcmd skills-generate` under each profile
+leaves every `references/<action>.md` page **byte-identical**:
 
-An executor is a physical binding — the same `IssueCredit` is DML against
-Spanner under one profile and something else under another. So an action's
-name, arguments, rules and blast radius are properties of the model, and
-nothing under `references/` is about where it runs. What is goes in `SKILL.md`,
-almost all of it in one section.
+```bash
+cd demo/semantic-model/skill
+kcmd skills-generate --profile spanner --out /tmp/spanner-skills --force
+kcmd skills-generate --profile alloydb --out /tmp/alloydb-skills --force
+diff /tmp/spanner-skills/commerce/references/issue-credit.md \
+     /tmp/alloydb-skills/commerce/references/issue-credit.md
+```
 
-Generate the commerce demo twice, once per profile, and the difference is that
-section and nothing else:
+`diff` exits with `0` and no output. Only `SKILL.md` changes, in
+`## Finding a record` and `## Running an action`:
 
-````console
-$ kcmd skills-generate --profile spanner --out spanner-skills
-$ kcmd skills-generate --profile alloydb --out alloydb-skills
-
-$ diff spanner-skills/commerce/references/issue-credit.md \
-       alloydb-skills/commerce/references/issue-credit.md
-
-$ diff spanner-skills/commerce/SKILL.md alloydb-skills/commerce/SKILL.md
-28,56d27
-< To read the store directly:
-<
-< ```bash
-< gcloud spanner databases execute-sql semantic_skill_demo \
-<   --instance=my-instance --project=my-project \
-<   --sql='SELECT ...'
-< ```
-<
-< Those are GoogleSQL statements. These tables are the whole of what there is to read, and the names to write in a statement are the table and column names below -- not the model's own names, which follow each column for cross-reference:
-<
-< ```
-< Customer -> table Customer
-<   column customer_id (Integer) = Customer.customerId
-<   column name (String) = Customer.name. The customer's display name, e.g. "Morgan Ellis".
-<   column email (String) = Customer.email
-< Order -> table Orders
-<   column order_id (Integer) = Order.orderId. The order's number, which is how both the customer and the desk refer to it.
-<   column customer_id (Integer) = Order.customerId
-<   column placed_on (Date) = Order.placedOn. The day the order was placed.
-<   column total (Decimal) = Order.total. What the customer owes on this order, in dollars.
-<   column status (String) = Order.status. OPEN or CLOSED.
-< LineItem -> table LineItem
-<   column line_item_id (String) = LineItem.lineItemId
-<   column order_id (Integer) = LineItem.orderId
-<   column type (String) = LineItem.type. item, tax, fee, or credit.
-<   column amount (Decimal) = LineItem.amount
-<   column memo (String) = LineItem.memo
-< ```
-<
-59c30
-< Everything above is true of this model wherever it is deployed. This section is not: it describes the binding this skill was generated from, which is profile `spanner`.
----
-> Everything above is true of this model wherever it is deployed. This section is not: it describes the binding this skill was generated from, which is profile `alloydb`.
-61c32
-< - Store: `my-project/my-instance/semantic_skill_demo`
----
-> - Store: `alloydb:my-project/us-central1/my-cluster/my-instance/semantic_skill_demo`
-````
-
-The first `diff` prints nothing: the reference page is the same bytes under both
-profiles, even though the two databases have different table names, a
-differently named column and a different SQL dialect between them. What changes
-in `SKILL.md` is the profile, the store, and the read path that only a Spanner
-store has.
-
-The judge isn't a second axis, and it's worth saying why, because it looks like
-one. A rule stated in words is settled by asking a judge, and the runtime asks
-it before the transaction opens — not the agent making the call. An agent that
-judged its own call would be the constrained thing certifying itself, which is
-no guard at all. So a guarded action only ever runs against a runtime that has a
-judge, and that's the runtime every generated skill is written for. Whether you
-had a judge configured when you ran `skills-generate` is a fact about that
-invocation, not about the deployment the document describes, so there's no flag
-here to write the other kind of skill.
-
-That section names the profile, the store, the executor kinds in play, and any
-action that can't run here. An agent that runs continuously should be handed
-these actions as tools by its own framework, which puts the action's guards to a
-judge before opening a transaction, and refuses rather than writing unchecked
-when it cannot settle one the model requires.
+```diff
+--- /tmp/spanner-skills/commerce/SKILL.md
++++ /tmp/alloydb-skills/commerce/SKILL.md
+@@ ... @@
+-To read the store directly:
+-
+-```bash
+-gcloud spanner databases execute-sql semantic_skill_demo \
+-  --instance=my-instance --project=my-project \
+-  --sql='SELECT ...'
+-```
++This skill supplies no canned CLI command for AlloyDB; connect to `my-project/us-central1/my-cluster/my-instance/semantic_skill_demo` via `psql` or the AlloyDB Auth Proxy to run `SELECT` queries.
+ 
+-Those are GoogleSQL statements. These tables are the whole of what there is to read, and the names to write in a statement are the table and column names below -- not the model's own names, which follow each column for cross-reference:
++Write PostgreSQL statements. These tables are the whole of what there is to read, and the names to write in a statement are the table and column names below -- not the model's own names, which follow each column for cross-reference:
+ 
+ ```
+-Customer -> table Customer
+-  column customer_id (Integer) = Customer.customerId
++Customer -> table "customer"
++  column "customer_id" (Integer) = Customer.customerId
+ ...
+-Order -> table Orders
++Order -> table "purchase_order"
+ ...
+-  column total (Decimal) = Order.total. What the customer owes on this order, in dollars.
++  column "order_total" (Decimal) = Order.total. What the customer owes on this order, in dollars.
+ ...
+-LineItem -> table LineItem
++LineItem -> table "order_line"
+ ...
+ ```
+ 
+ ## Running an action
+ 
+-Everything above is true of this model wherever it is deployed. This section is not: it describes the binding this skill was generated from, which is profile `spanner`.
++Everything above is true of this model wherever it is deployed. This section is not: it describes the binding this skill was generated from, which is profile `alloydb`.
+ 
+-- Store: `my-project/my-instance/semantic_skill_demo`
++- Store: `alloydb:my-project/us-central1/my-cluster/my-instance/semantic_skill_demo`
+ - Executor: `sql`
+```
 
 ## What it doesn't generate yet
 
-* **Reads.** A skill describes the writes. Rather than generating read tools,
-  the skill says where a key has to come from and, for a Spanner store, gives
-  the `gcloud` line that reads it and the schema to write against. A model bound
-  to AlloyDB gets neither, so an agent handed a name under that profile has
-  nothing in the skill telling it how to reach a key.
-* **Metrics.** A metric reaches BigQuery as a `MEASURE`; nothing lowers one into
-  a skill.
-* **A plugin.** An [Agent Plugin](https://agent-plugins.org/) bundles skills with
-  an MCP server and an identity. Its skills are exactly this format — the plugin
-  spec delegates to it — so a plugin would wrap what's generated here rather
-  than replace it.
+- **No metrics or relationships in the skill.** `SKILL.md` emits the entity
+  table and column map for looking up keys (`## Finding a record`) and
+  `references/<action>.md` emits the write actions. Declared `metrics` and
+  `relationships` are not emitted into the skill package.
+- **No plugin manifest or MCP server bundle.** When an action uses an `mcp`,
+  `rest`, or `grpc` executor, `SKILL.md` prints its target coordinates
+  (`MCP tool <tool> on <server>`, `HTTP <METHOD> <endpoint>`,
+  `gRPC <service>/<method>`) so the agent or its harness can call it.
+  `kcmd skills-generate` does not emit a plugin manifest or register MCP servers
+  with the harness.
+- **No CLI runner for actions or judged guards.** `kcmd skills-generate`
+  produces the static skill files from the model and profile. Executing actions
+  and settling judged guards before opening a transaction is performed by the
+  agent framework or tool runner that hosts the model's tools.
 
 ## See also
 
-* [Modeling write operations](actions.md) — declaring the actions, parameters,
-  and guards a skill describes
-* [Binding profiles](profiles.md) — the profile the deployment-specific section
-  reads
+- [`actions.md`](actions.md) — declaring actions, parameters,
+  `sql`/`mcp`/`rest`/`grpc` executors, `affects`, and judged constraints
+  (`guards`).
+- [`profiles.md`](profiles.md) — separating logical models from `spanner`,
+  `alloydb`, and `bigquery` binding profiles.
+- [`reference.md`](reference.md) — full YAML schema reference for semantic
+  models.
+- [`demo/semantic-model/skill/`](../../demo/semantic-model/skill/README.md) —
+  end-to-end walkthrough of `commerce` (`IssueCredit`) under Spanner and AlloyDB
+  profiles.
