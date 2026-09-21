@@ -479,36 +479,6 @@ const DEFINITELY_NOT_COMMITTED = new Set([400, 401, 403, 404, 409, 412]);
 
 
 /**
- * The `kcmd action-run` line that would actually run this action here.
- *
- * Exported for the same reason `whyRefusedWithoutRunning` is: which arguments
- * a call requires is a rule the runtime already owns, and a second copy drifts
- * silently -- into a suggested command that is refused the moment it is run.
- *
- * A guard changes none of this. `kcmd action-run` settles none of them however
- * the action is written, so there is no flag about guards for the line to
- * carry and no reader who needs one to make the call work.
- */
-export function runLine(a: Action): string {
-  return [`kcmd action-run ${a.name}`, ...runFlags(a)].join(' ');
-}
-
-/**
- * The flags `runLine` would pass, one per element, without the command in
- * front of them.
- *
- * Separate from `runLine` because a caller that rebuilds the head -- to quote
- * an action name for a block meant to be copied and run, say -- would
- * otherwise have to take the rendered line apart to get at the flags, and the
- * only thing in it to split on is ' --', which an action name is free to
- * contain. Nothing constrains what is in a name.
- */
-export function runFlags(a: Action): string[] {
-  return a.parameters.filter(isParameterRequired)
-      .map(p => `--arg ${p.name}=<${p.type ?? 'no type'}>`);
-}
-
-/**
  * Why this runtime would refuse `action` before opening a transaction, or null
  * if it would run it.
  *
@@ -576,9 +546,10 @@ function unsafeToRunUnchecked(
                                .map(c => c.name));
   const guards = (action.guards ?? []).filter(g => !advisory.has(g));
   // A judgment with no words in it -- or no judgment at all -- is nothing to
-  // put to a judge. `kcmd` validates the model first, so this arrives only
-  // through the library entry point, where asking anyway would refuse every
-  // call and cite a rule it cannot quote.
+  // put to a judge. `kcmd push` validates the model before deploying, but a
+  // caller reaching the runtime directly can hand in an unvalidated model,
+  // where asking anyway would refuse every call and cite a rule it cannot
+  // quote.
   const blank =
       (model.constraints ?? [])
           .filter(c => guards.includes(c.name) && !(c.judgment ?? '').trim())
