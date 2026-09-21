@@ -7,10 +7,11 @@
 > names — BigQuery Graph or Spanner Graph — and the logical model to Knowledge
 > Catalog, which takes it under any profile.
 >
-> An action's statements run against an operational store: **Spanner or
-> AlloyDB**. An AlloyDB target runs and does not push, because AlloyDB has no
-> property-graph DDL for a push to deploy; a BigQuery target pushes and does
-> not run. A Spanner target does both.
+> An action's statements run against whatever store the profile binds. All
+> three backends execute SQL DML, so all three can carry a write. What differs
+> is the **push**: an AlloyDB target runs and does not push, because AlloyDB has
+> no property-graph DDL for a push to deploy, while Spanner and BigQuery do
+> both.
 >
 > A profile may still bind an entity to any other store (a lake table, a
 > partner's schema). `kcmd` merges it and reports its availability, and neither
@@ -126,7 +127,8 @@ write differently — an action the profile does not mention keeps the default.
 This is the opposite of a field's column, which a profile must restate or leave
 unbound. The asymmetry is deliberate: a column inherited into a renamed schema
 binds to the wrong data and returns it silently, while an executor names a
-whole mechanism, so a wrong one fails at the first call rather than answering. To
+whole mechanism, so a wrong one fails rather than answering — at the first call,
+or already at push where the mechanism is a `sql` executor the store rejects. To
 withdraw an inherited executor — a read-only binding that performs no writes at
 all — a profile writes `executor: null`, which leaves the action declared and
 unavailable there.
@@ -435,6 +437,14 @@ writes nothing.
   dry run; a table that is missing or inaccessible fails and names it. Column
   names are not probed here — a mistyped column resolves to a real table and is
   caught at deploy, when BigQuery rejects the generated graph.
+- **Rejected DML** — where this profile deploys to Spanner or BigQuery, every
+  statement in an action's `sql` executor is planned against that store without
+  running it, and a store that refuses one fails the push and quotes back why.
+  The profile is what picks the store, so the same statement can pass under one
+  profile and fail under another. A profile deploying to **AlloyDB** is the
+  exception: its statements are checked for shape but never sent anywhere, so
+  nothing confirms the names in them. See
+  [statements use your database names](actions.md#statements-use-your-database-names).
 - **Availability summary** — push resolves the dependency graph and prints, per
   profile, how many entities, metrics, relationships, and actions the binding
   leaves unavailable. `kcmd profiles` lists each one with the reason that stops
