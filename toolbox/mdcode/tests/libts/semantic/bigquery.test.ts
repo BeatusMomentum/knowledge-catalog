@@ -489,27 +489,24 @@ describe('descriptive metadata: structured synonyms vs folded description', () =
       });
 
   test(
-      'structured examples render as JSON and never [object Object]',
+      'examples render as a joined line and custom ai_context members stay out of the DDL',
       () => {
         const m = model();
         m.entities[0].fields[1].aiContext = {
           instructions: 'Use for net revenue',
           synonyms: ['total', 'value'],
-          examples: [
-            {key1: 'val1', key2: 'val2'},
-            {foo: 'bar', count: 42},
-            'plain string example',
-          ],
+          examples: ['net revenue last month', 'revenue by region'],
           additionalProperties: {
             custom_hint: 'prioritize verified orders',
           },
         };
         const {ddl} = generatePropertyGraph(m, GEN_OPTS);
-        expect(ddl).not.toContain('[object Object]');
-        // Inside the BigQuery DDL's double-quoted description literal, JSON
-        // quotes are backslash-escaped.
         expect(ddl).toContain(
-            'Examples: {\\"key1\\":\\"val1\\",\\"key2\\":\\"val2\\"}; {\\"foo\\":\\"bar\\",\\"count\\":42}; plain string example');
+            'Examples: net revenue last month; revenue by region');
+        // A custom member has no slot in a property-graph deployment; it
+        // reaches Knowledge Catalog only.
+        expect(ddl).not.toContain('custom_hint');
+        expect(ddl).not.toContain('prioritize verified orders');
       });
 
   test(
