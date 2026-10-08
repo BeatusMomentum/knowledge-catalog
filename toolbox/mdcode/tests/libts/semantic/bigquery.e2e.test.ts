@@ -22,7 +22,7 @@
 // Unit-level tests for the same generator (inline IR, inline goldens) live in
 // `bigquery.test.ts`.
 
-import {describe, expect, test} from 'bun:test';
+import {beforeAll, describe, expect, test} from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -31,7 +31,12 @@ import * as yaml from 'yaml';
 import {generatePropertyGraph} from '../../../src/libts/semantic/bigquery';
 import {loadModels, loadSemanticModels, LoadOptions} from '../../../src/libts/semantic/loader';
 import {mergeProfile, pruneUnavailable} from '../../../src/libts/semantic/resolve_profiles';
+import {loadSqlEngine} from '../../../src/libts/semantic/sql_parser';
 import {validatePushRequirements} from '../../../src/libts/semantic/validate';
+
+beforeAll(async () => {
+  await loadSqlEngine();
+});
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -44,7 +49,6 @@ const CORPUS = [
   'vendor_dialects.yaml',
   'measure_lowering.yaml',
   'metric_skips.yaml',
-  'keyless_dimension.yaml',
   'hierarchy_graph.yaml',
   'reserved_words.yaml',
   'reserved_words_inherit.yaml',
@@ -104,6 +108,31 @@ describe(
         });
       }
     });
+
+
+// keyless_dimension.yaml joins to a dataset with no key, which push rejects.
+// The generator still drops a node with no key, and every edge to it, if one
+// reaches it, so its golden stays outside the push-validated corpus.
+describe('a relationship to a keyless dataset', () => {
+  test('is rejected by push validation', () => {
+    const {models} = loadFixture('keyless_dimension.yaml');
+    expect(validatePushRequirements(
+               models.map(model => ({document: 'keyless_dimension.yaml', model})),
+               {targetOptional: true})
+               .join('\n'))
+        .toContain("cover no primary or unique key of 'nokey'");
+  });
+
+  test('is dropped by the generator, with its node, if one reaches it', () => {
+    const golden = goldenPath('keyless_dimension.yaml');
+    const actual = render('keyless_dimension.yaml');
+    if (process.env.UPDATE_GOLDENS) {
+      fs.writeFileSync(golden, actual);
+      return;
+    }
+    expect(actual).toBe(fs.readFileSync(golden, 'utf8'));
+  });
+});
 
 
 // A golden captures what the generator emits, and the generator runs only on a

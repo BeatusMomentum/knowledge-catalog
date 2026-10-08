@@ -730,16 +730,19 @@ describe('inheritance rules', () => {
     }
   });
 
-  test('a subtype redeclaring an inherited field with nothing set passes', () => {
+  // A redeclaration sets `expression` and nothing else.
+  test('a subtype redeclaring an inherited field with nothing set is rejected', () => {
     for (const f of [{name: 'name'}, {name: 'name', stringForm: true},
                      {name: 'name', importedDialect: 'SNOWFLAKE'}]) {
       expect(check({
         entities: [customer, ent('vip', {extends: ['customer'], fields: [f]})],
-      })).toEqual([]);
+      }).join('\n')).toContain(
+          "field 'name' is inherited from 'customer'; restate it only to " +
+          "rebind it with 'expression', or remove the line.");
     }
   });
 
-  test('name-only redeclarations on both sides of a diamond pass', () => {
+  test('name-only redeclarations on both sides of a diamond are rejected', () => {
     const party = ent('party', {
       abstract: true, dataSource: undefined, keys: [],
       fields: [{name: 'id', type: 'String'}],
@@ -748,16 +751,19 @@ describe('inheritance rules', () => {
       abstract: true, dataSource: undefined, keys: [], extends: ['party'],
       fields: [{name: 'id'}],
     });
-    expect(check({
+    const errors = check({
       entities: [
         party, side('customer'), side('account'),
         ent('vip', {extends: ['customer', 'account'], keys: ['id'],
                     fields: [{name: 'id', expression: 'vip_id'}]}),
       ],
-    })).toEqual([]);
+    }).join('\n');
+    expect(errors).toContain("entity 'customer' in model");
+    expect(errors).toContain("entity 'account' in model");
+    expect(errors).toContain("field 'id' is inherited from 'party'");
   });
 
-  test('a profile binds a field the logical model redeclares by name alone', () => {
+  test('a legacy profile binds an inherited field the model does not redeclare', () => {
     const logical = `version: "0.2.0.dev0/google"
 semantic_model:
   - name: sales
@@ -771,7 +777,6 @@ semantic_model:
         primary_key: [id]
         fields:
           - { name: id, datatype: Integer }
-          - { name: name }
 `;
     const profile = `version: "0.2.0.dev0/google"
 semantic_model:
@@ -813,11 +818,12 @@ semantic_model:
           [loaded(m)], {targetOptional: true, fieldsPruned: true});
       expect(errors.join('\n')).toMatch(want);
     }
-    // An unknown parent is still excused on a pruned model.
+    // Pruning never drops an entity, so an unknown parent is reported on a
+    // pruned model too.
     expect(validatePushRequirements(
                [loaded(model({entities: [ent('a', {extends: ['gone']})]}))],
-               {targetOptional: true, fieldsPruned: true}))
-        .toEqual([]);
+               {targetOptional: true, fieldsPruned: true}).join('\n'))
+        .toContain("extends unknown entity 'gone'");
   });
 
   test('an abstract entity is rejected for a source, keys or a bound field', () => {
@@ -846,10 +852,11 @@ semantic_model:
     const person = ent('person');
     const employee = ent('employee', {extends: ['person']});
     const order = ent('order');
+    // Each join reaches the target's key, `<name>_id`.
     const rel = (to: string) => ({
       name: `order_${to}`,
       source: {entity: 'order', columns: ['c']},
-      destination: {entity: to, columns: ['c']},
+      destination: {entity: to, columns: [`${to}_id`]},
     });
     const metric = (m: Partial<Metric>): Metric =>
         ({name: 'm1', expression: 'COUNT(*)', ...m} as Metric);
@@ -884,7 +891,7 @@ semantic_model:
         relationships: [{
           name: 'knows',
           source: {entity: 'person', columns: ['c']},
-          destination: {entity: 'person', columns: ['c']},
+          destination: {entity: 'person', columns: ['person_id']},
         }],
       });
       expect(errors.filter(e => e.includes("relationship 'knows'")).length).toBe(1);
@@ -908,5 +915,102 @@ semantic_model:
       expect(check({entities: [person, employee], metrics: [metric({entity: 'employee'})]}))
           .toEqual([]);
     });
+  });
+});
+
+
+// A relationship's cardinality comes from the key its to_columns cover, so a
+// join that covers no key is rejected on every push, a catalog-only one
+// included.
+describe('a relationship joins on a key of its target', () => {
+  const ent = (name: string, over: Partial<Entity> = {}): Entity => ({
+    name, dataSource: `p.d.${name}`, keys: ['id'], fields: [], ...over,
+  });
+  const join = (to: string[]) => ({
+    name: 'placed_by',
+    source: {entity: 'orders', columns: to.map(c => `o_${c}`)},
+    destination: {entity: 'customer', columns: to},
+  });
+  const check = (customer: Entity, to: string[]) => validatePushRequirements(
+      [loaded(model({entities: [ent('orders'), customer], relationships: [join(to)]}))],
+      {targetOptional: true});
+
+  test('a join on a key, a unique key or a superset of one passes', () => {
+    expect(check(ent('customer'), ['id'])).toEqual([]);
+    expect(check(ent('customer', {uniqueKeys: [['email']]}), ['email'])).toEqual([]);
+    expect(check(ent('customer'), ['id', 'tenant'])).toEqual([]);
+  });
+
+  test('column names compare ignoring case and backticks', () => {
+    expect(check(ent('customer'), ['ID'])).toEqual([]);
+    expect(check(ent('customer'), ['`id`'])).toEqual([]);
+  });
+
+  test('a join name matches a field exactly, as the generators read it', () => {
+    // The generators read `ID` as a column, not as field `id`, so the join
+    // does not reach the key they emit, `cust_id`.
+    const named = ent('customer', {fields: [{name: 'id', expression: 'cust_id'}]});
+    expect(check(named, ['ID']).join('\n'))
+        .toContain("cover no primary or unique key of 'customer'");
+  });
+
+  test('a join that covers no key is rejected', () => {
+    expect(check(ent('customer'), ['name']).join('\n')).toContain(
+        "relationship 'placed_by' in model 'm' (doc): its to_columns [\"name\"] " +
+        "cover no primary or unique key of 'customer'");
+  });
+
+  test('a target with no key cannot be joined to', () => {
+    expect(check(ent('customer', {keys: []}), ['id']).join('\n'))
+        .toContain("cover no primary or unique key of 'customer'");
+  });
+
+  test('a relationship with no join columns yet is not checked', () => {
+    expect(check(ent('customer', {keys: []}), [])).toEqual([]);
+  });
+});
+
+
+describe('a relationship key check reads names as columns', () => {
+  const join = (toEntity: string, to: string[]) => ({
+    name: 'placed_by',
+    source: {entity: 'orders', columns: to.map(c => `o_${c}`)},
+    destination: {entity: toEntity, columns: to},
+  });
+  const orders: Entity = {name: 'orders', dataSource: 'p.d.o', keys: ['o_id'], fields: []};
+  const check = (entities: Entity[], rel: any) => validatePushRequirements(
+      [loaded(model({entities: [orders, ...entities], relationships: [rel]}))],
+      {targetOptional: true});
+
+  test('a key that names a field covers a join on that field\'s column', () => {
+    const customer: Entity = {
+      name: 'customer', dataSource: 'p.d.c', keys: ['customerId'],
+      fields: [{name: 'customerId', expression: 'customer_id'}],
+    };
+    expect(check([customer], join('customer', ['customer_id']))).toEqual([]);
+  });
+
+  // The column is bound only in a profile, so this binding cannot tell which
+  // column the key is; the profile's binding is checked instead.
+  test('a key that names a field with no column yet is not judged', () => {
+    const customer: Entity = {
+      name: 'customer', dataSource: 'p.d.c', keys: ['customerId'],
+      fields: [{name: 'customerId'}],
+    };
+    expect(check([customer], join('customer', ['customer_id']))).toEqual([]);
+  });
+
+  test('a relationship through a junction table is not checked', () => {
+    const customer: Entity = {name: 'customer', dataSource: 'p.d.c', keys: ['id'], fields: []};
+    expect(check([customer], {...join('customer', ['not_a_key']),
+                              association: {dataSource: 'p.d.oc'}}))
+        .toEqual([]);
+  });
+
+  test('a relationship to an abstract entity gets only the concrete-leaf error', () => {
+    const party: Entity = {name: 'party', abstract: true, dataSource: '', keys: [], fields: []};
+    const errors = check([party], join('party', ['id'])).join('\n');
+    expect(errors).toContain("connects 'party', which is abstract");
+    expect(errors).not.toContain('cover no primary or unique key');
   });
 });

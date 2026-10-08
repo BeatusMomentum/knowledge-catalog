@@ -11,22 +11,26 @@
 //
 // Two passes live here:
 //   - mergeProfile overlays one profile document onto the logical document,
-//     enforcing the binding-only contract: a profile may set physical facets and
-//     may leave a field unbound, but it may not add or remove elements or change
-//     what anything means. It runs on the parsed authoring documents (the
-//     readable, sugared form) before schema validation, so a profile is written
-//     in the same syntax as the model.
+//     enforcing the binding-only contract: a profile rebinds what it names,
+//     leaves everything else as the model file has it, may exclude fields and
+//     metrics, and may not add elements or change what anything means. It runs
+//     on the parsed authoring documents (the readable, sugared form) before
+//     schema validation, so a profile is written in the same syntax as the
+//     model.
 //   - pruneUnavailable runs over the loaded IR and drops each field left unbound
-//     plus everything that depends on it -- a metric whose expression reads it, a
-//     relationship whose join column is unbound, a cross-entity metric over a
-//     dropped relationship -- returning the pruned model and a per-profile
-//     availability report. Availability propagates UP the dependency graph from
-//     the fields a profile binds.
+//     or excluded, every field that reads one of those, and every metric whose
+//     expression reads any of them, returning the pruned model and a
+//     per-profile availability report. Keys and join columns are physical
+//     columns rather than fields, so pruning fields never removes an entity or
+//     a relationship.
 
 import * as yaml from 'yaml';
 
-import {Action, isFieldBound, Metric, Relationship, SemanticModel} from './ir';
-import {blankStringLiterals, escapeRegExp, referencedEntityNames,} from './sql_expr_utils';
+import {Action, ALLOWED_DIALECTS, DialectExpression, Entity, Executor, Field, FIELD_BINDING_KEYS, isFieldBound, Metric, ProfileEntityBinding, ProfileRelationshipBinding, ProfileSpec, Relationship, SemanticModel, SqlDialect} from './ir';
+import {resolveInheritance} from './resolve_inheritance';
+import {columnReferences, fieldsReadOn, isColumnName, keysCoveredByColumns} from './sql_expr_utils';
+import {SqlColumn} from './sql_parser';
+import {YAML_OPTIONS} from './yaml_options';
 
 // The implicit profile: the inline bindings already in the model document (the
 // combined single-file form). It is never merged -- it IS the document as
@@ -41,44 +45,70 @@ export interface MergeResult {
   // A binding-only or unknown-name violation, naming the offending path. When
   // set, `doc` should not be deployed.
   error?: string;
+  // The fields and metrics the profile excludes. The merged document keeps
+  // them all, so a catalog push publishes the whole logical model. Apply them
+  // to the loaded model with applyProfileExclusions before pruning: a field
+  // exclusion applies to the entity that names it and not to its descendants,
+  // which the merged document alone cannot say.
+  excluded: ProfileExclusion[];
 }
+
+// One thing a profile excludes in one model: a field on one entity, or a
+// metric.
+export type ProfileExclusion = {
+  model: string; entity: string; field: string;
+}|{model: string; metric: string};
 
 // Keys a profile may carry at each level. Everything else is a logical
 // declaration the model owns; setting it in a profile is rejected so swapping a
 // profile can move data but never change what the model means.
-const PROFILE_MODEL_KEYS = new Set([
-  'name', 'version', 'deployment_target', 'entities', 'datasets', 'actions',
+//
+// A profile file is a top-level profile object (`name`, `entities`, ...). The
+// older form, a `semantic_model:` wrapper around partial models, is still
+// accepted until legacy profile selection is removed; LEGACY_MODEL_KEYS
+// describes it. It takes the keys the new form takes, plus the
+// `deployment_target` and `version` it always has.
+const PROFILE_FILE_KEYS = new Set([
+  'name', 'entities', 'relationships', 'metrics_exclude', 'actions',
 ]);
-const PROFILE_ENTITY_KEYS = new Set(['name', 'source', 'fields']);
+const PROFILE_ENTITY_KEYS = new Set([
+  'name', 'source', 'primary_key', 'unique_keys', 'fields', 'fields_exclude',
+]);
+const PROFILE_RELATIONSHIP_KEYS =
+    new Set(['name', 'from_columns', 'to_columns']);
 const PROFILE_FIELD_KEYS = new Set(['name', 'expression']);
 const PROFILE_ACTION_KEYS = new Set(['name', 'executor']);
+const LEGACY_MODEL_KEYS = new Set([
+  'name', 'version', 'deployment_target', 'entities', 'datasets',
+  'relationships', 'metrics_exclude', 'actions',
+]);
 
 /**
- * Overlays `profileDoc` onto `logicalDoc`, matching models, entities, fields by
- * `name`, and returns the merged document. The inputs are never mutated. A
- * profile supplies physical bindings only; a violation of that contract (setting
- * a declaration, or naming an element the logical model does not declare) is
- * returned as `error`, naming the path.
+ * Overlays `profileDoc` onto `logicalDoc` and returns the merged document. The
+ * inputs are never mutated. A profile is an overlay: it rebinds what it names
+ * and leaves everything else as the model file has it. It supplies physical
+ * bindings only; a violation of that contract (setting a declaration, or naming
+ * an element the logical model does not declare) is returned as `error`,
+ * naming the path.
  */
 export function mergeProfile(
     logicalDoc: unknown, profileDoc: unknown,
     profileName: string): MergeResult {
   const warnings: string[] = [];
-  const merged = structuredClone(logicalDoc) as any;
+  const merged = plainCopy(logicalDoc);
   const profile = profileDoc as any;
 
   if (!merged || typeof merged !== 'object' ||
       !Array.isArray(merged.semantic_model)) {
     return {
-      doc: merged, warnings,
+      doc: merged, warnings, excluded: [],
       error: 'the logical model is not a semantic_model document',
     };
   }
-  if (!profile || typeof profile !== 'object' ||
-      !Array.isArray(profile.semantic_model)) {
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
     return {
-      doc: merged, warnings,
-      error: `profile '${profileName}' is not a semantic_model document`,
+      doc: merged, warnings, excluded: [],
+      error: `profile '${profileName}' is not a profile document`,
     };
   }
 
@@ -89,22 +119,54 @@ export function mergeProfile(
     }
   }
 
-  // Clear the logical clone's inline field bindings before overlaying the
-  // profile, so for the models the profile targets the profile alone decides
-  // what is bound (see below). A model the profile does not name keeps its
-  // inline bindings untouched.
-  const profileModelNames = new Set<string>();
-  for (const pm of profile.semantic_model) {
-    if (pm && typeof pm === 'object' && typeof pm.name === 'string') {
-      profileModelNames.add(pm.name);
+  // The models this profile binds. A profile file belongs to the one model it
+  // sits beside; the legacy wrapper names its models.
+  const legacy = Array.isArray(profile.semantic_model);
+  let targets: Array<{lm: any; pm: any}>;
+  if (legacy) {
+    const extra = Object.keys(profile).find(
+        k => k !== 'semantic_model' && k !== 'version');
+    if (extra) {
+      return {
+        doc: merged, warnings, excluded: [],
+        error: `profile '${profileName}': a 'semantic_model:' profile carries ` +
+            `only 'version' and 'semantic_model', not '${extra}'`,
+      };
     }
+    targets = [];
+    for (const pm of profile.semantic_model) {
+      if (!pm || typeof pm !== 'object' || typeof pm.name !== 'string') {
+        return {
+          doc: merged, warnings, excluded: [],
+          error: `profile '${profileName}': every entry in 'semantic_model' ` +
+              `is a mapping with a 'name'`,
+        };
+      }
+      const lm = logicalByName.get(pm.name);
+      if (!lm) {
+        return {
+          doc: merged, warnings, excluded: [],
+          error: `profile '${profileName}': model '${
+              pm.name}' is not in the logical model`,
+        };
+      }
+      targets.push({lm, pm});
+    }
+  } else {
+    if (logicalByName.size !== 1) {
+      return {
+        doc: merged, warnings, excluded: [],
+        error: `profile '${profileName}' binds one model, but the logical ` +
+            `document declares ${logicalByName.size}`,
+      };
+    }
+    targets = [{lm: [...logicalByName.values()][0], pm: profile}];
   }
-  stripInlineFieldExpressions(merged, profileModelNames);
 
-  const sqlInLogical = findLogicalSqlExecutor(merged, profileModelNames);
+  const sqlInLogical = findLogicalSqlExecutor(targets.map(t => t.lm));
   if (sqlInLogical) {
     return {
-      doc: merged, warnings,
+      doc: merged, warnings, excluded: [],
       error: `profile '${profileName}': action '${sqlInLogical.action}' in ` +
           `model '${sqlInLogical.model}' declares a 'sql' executor. A ` +
           `statement names one database's own tables and columns, so it ` +
@@ -113,65 +175,159 @@ export function mergeProfile(
     };
   }
 
-  for (const pm of profile.semantic_model) {
-    if (!pm || typeof pm !== 'object') continue;
-    const lm = logicalByName.get(pm.name);
-    if (!lm) {
-      return {
-        doc: merged, warnings,
-        error: `profile '${profileName}': model '${
-            pm.name}' is not in the logical model`,
-      };
-    }
-    const err = mergeModel(lm, pm, profileName);
-    if (err) return {doc: merged, warnings, error: err};
+  const excluded: ProfileExclusion[] = [];
+  for (const {lm, pm} of targets) {
+    const err = legacy ? mergeLegacyModel(lm, pm, profileName, excluded) :
+                         mergeProfileFile(lm, pm, profileName, excluded);
+    if (err) return {doc: merged, warnings, excluded: [], error: err};
   }
-
-  return {doc: merged, warnings};
+  return {doc: merged, warnings, excluded};
 }
 
-function mergeModel(lm: any, pm: any, profileName: string): string|undefined {
+// A deep copy in which every node is its own object. structuredClone keeps a
+// YAML anchor and its aliases as one object, so a profile that rebinds or
+// excludes a field on one entity would change every entity that aliases it.
+function plainCopy(value: unknown): any {
+  if (Array.isArray(value)) return value.map(plainCopy);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, plainCopy(v)]));
+  }
+  return value;
+}
+
+/**
+ * Marks on `model` the fields and metrics a merged profile excludes. Inheritance
+ * resolution leaves an excluded field off the entity that names it while its
+ * descendants still inherit the declaration, and pruning drops an excluded
+ * metric. Returns a copy when anything applies, and `model` itself otherwise;
+ * the input is never mutated.
+ */
+export function applyProfileExclusions(
+    model: SemanticModel,
+    excluded: ReadonlyArray<ProfileExclusion>): SemanticModel {
+  const mine = excluded.filter(x => x.model === model.name);
+  if (!mine.length) return model;
+  const out = structuredClone(model);
+  for (const e of out.entities ?? []) {
+    const names = mine.flatMap(
+        x => 'field' in x && x.entity === e.name ? [x.field] : []);
+    if (names.length) {
+      e.excludedFields = [...new Set([...(e.excludedFields ?? []), ...names])];
+    }
+  }
+  const metrics = mine.flatMap(x => 'metric' in x ? [x.metric] : []);
+  if (metrics.length) {
+    out.excludedMetrics =
+        [...new Set([...(out.excludedMetrics ?? []), ...metrics])];
+  }
+  return out;
+}
+
+// Overlays a top-level profile object onto the one model it binds. The object
+// is read first exactly as loadProfileFile reads it, so push and the profile
+// checks agree on what a valid profile file is.
+function mergeProfileFile(
+    lm: any, pf: any, profileName: string,
+    excluded: ProfileExclusion[]): string|undefined {
+  try {
+    profileSpecOf(pf, profileName);
+  } catch (err: any) {
+    return err?.message ?? String(err);
+  }
+  const err = mergeActions(lm, pf.actions, profileName) ??
+      mergeEntities(
+             lm, pf.entities, PROFILE_ENTITY_KEYS, profileName, excluded) ??
+      mergeRelationships(lm, pf.relationships, profileName) ??
+      excludeMetrics(lm, pf.metrics_exclude, profileName, excluded);
+  return err;
+}
+
+// Overlays one partial model from the legacy `semantic_model:` wrapper.
+function mergeLegacyModel(
+    lm: any, pm: any, profileName: string,
+    excluded: ProfileExclusion[]): string|undefined {
   for (const k of Object.keys(pm)) {
-    if (!PROFILE_MODEL_KEYS.has(k)) {
+    if (!LEGACY_MODEL_KEYS.has(k)) {
       return declError(profileName, `model '${pm.name}'`, k);
     }
   }
   if (pm.deployment_target !== undefined) {
     lm.deployment_target = pm.deployment_target;
   }
+  return mergeActions(lm, pm.actions, profileName) ??
+      mergeEntities(
+             lm, pm.entities ?? pm.datasets, PROFILE_ENTITY_KEYS, profileName,
+             excluded) ??
+      mergeRelationships(lm, pm.relationships, profileName) ??
+      excludeMetrics(lm, pm.metrics_exclude, profileName, excluded);
+}
 
-  if (pm.actions !== undefined) {
-    if (!Array.isArray(pm.actions)) {
-      return `profile '${profileName}': 'actions' must be a list`;
-    }
-    const lActions = indexByName(lm.actions);
-    for (const pa of pm.actions) {
-      if (!pa || typeof pa !== 'object') continue;
-      const la = lActions.get(pa.name);
-      if (!la) {
-        return `profile '${profileName}': action '${
-            pa.name}' is not in the logical model`;
-      }
-      const err = mergeAction(la, pa, profileName);
-      if (err) return err;
-    }
+function mergeActions(lm: any, actions: unknown, profileName: string): string|
+    undefined {
+  if (actions === undefined) return undefined;
+  if (!Array.isArray(actions)) {
+    return `profile '${profileName}': 'actions' must be a list`;
   }
+  const lActions = indexByName(lm.actions);
+  for (const pa of actions) {
+    if (!pa || typeof pa !== 'object') continue;
+    const la = lActions.get(pa.name);
+    if (!la) {
+      return `profile '${profileName}': action '${
+          pa.name}' is not in the logical model`;
+    }
+    const err = mergeAction(la, pa, profileName);
+    if (err) return err;
+  }
+  return undefined;
+}
 
-  const pEntities = pm.entities ?? pm.datasets;
-  if (pEntities === undefined) return undefined;
-  if (!Array.isArray(pEntities)) {
+function mergeEntities(
+    lm: any, entities: unknown, allowed: Set<string>, profileName: string,
+    excluded: ProfileExclusion[]): string|undefined {
+  if (entities === undefined) return undefined;
+  if (!Array.isArray(entities)) {
     return `profile '${profileName}': 'entities' must be a list`;
   }
+  for (const pe of entities) {
+    if (!pe || typeof pe !== 'object' || Array.isArray(pe) ||
+        typeof pe.name !== 'string') {
+      return `profile '${profileName}': every entry in 'entities' is a ` +
+          `mapping with a 'name'`;
+    }
+  }
+  const dup = duplicateName(entities);
+  if (dup) return `profile '${profileName}': entity '${dup}' is listed twice`;
   const lByName = indexByName(lm.entities ?? lm.datasets);
-  for (const pe of pEntities) {
-    if (!pe || typeof pe !== 'object') continue;
+  for (const pe of entities) {
     const le = lByName.get(pe.name);
     if (!le) {
       return `profile '${profileName}': entity '${
           pe.name}' is not in the logical model`;
     }
-    const err = mergeEntity(le, pe, profileName);
+    // An abstract entity has no table, so no profile binds it.
+    if (le.abstract === true) {
+      return `profile '${profileName}': entity '${
+          pe.name}' is abstract, so a profile cannot bind it`;
+    }
+    const err = mergeEntity(le, pe, allowed, profileName, lm);
     if (err) return err;
+    for (const field of pe.fields_exclude ?? []) {
+      excluded.push({model: lm.name, entity: pe.name, field});
+    }
+  }
+  return undefined;
+}
+
+// The first name a list of named entries carries twice, or undefined.
+function duplicateName(list: unknown[]): string|undefined {
+  const seen = new Set<string>();
+  for (const item of list) {
+    const name = (item as any)?.name;
+    if (typeof name !== 'string') continue;
+    if (seen.has(name)) return name;
+    seen.add(name);
   }
   return undefined;
 }
@@ -180,10 +336,7 @@ function mergeModel(lm: any, pm: any, profileName: string): string|undefined {
 // INHERITED when the profile says nothing: an action the profile does not
 // mention keeps whatever the model declared, so a model can state one default
 // executor and a profile override only the stores that perform the write
-// differently. A field cannot work that way -- inheriting a column name into a
-// renamed schema binds to the wrong column silently -- but an executor names a
-// whole mechanism, and a wrong one fails loudly at the first call rather than
-// returning another column's data.
+// differently.
 //
 // Withdrawing an inherited executor is therefore explicit: `executor: null`
 // says this store performs the write by no means at all, which leaves the
@@ -202,33 +355,118 @@ function mergeAction(la: any, pa: any, profileName: string): string|undefined {
   return undefined;
 }
 
-function mergeEntity(le: any, pe: any, profileName: string): string|undefined {
+// Overlays one entity's bindings. A field the profile names in `fields` is
+// rebound; one it names in `fields_exclude` has its binding cleared, so
+// pruneUnavailable drops it; every other field keeps what the model file gave
+// it.
+function mergeEntity(
+    le: any, pe: any, allowed: Set<string>, profileName: string,
+    lm: any): string|undefined {
   for (const k of Object.keys(pe)) {
-    if (!PROFILE_ENTITY_KEYS.has(k)) {
+    if (!allowed.has(k)) {
       return declError(profileName, `entity '${pe.name}'`, k);
     }
   }
   if (pe.source !== undefined) le.source = pe.source;
+  if (pe.primary_key !== undefined) le.primary_key = pe.primary_key;
+  if (pe.unique_keys !== undefined) le.unique_keys = pe.unique_keys;
 
-  if (pe.fields === undefined) return undefined;
-  if (!Array.isArray(pe.fields)) {
-    return `profile '${profileName}': entity '${
-        pe.name}' 'fields' must be a list`;
+  for (const key of ['fields', 'fields_exclude']) {
+    if (pe[key] !== undefined && !Array.isArray(pe[key])) {
+      return `profile '${profileName}': entity '${pe.name}' '${
+          key}' must be a list`;
+    }
   }
-  const lByName = indexByName(le.fields ?? []);
-  for (const pf of pe.fields) {
-    if (!pf || typeof pf !== 'object') continue;
-    const lf = lByName.get(pf.name);
+  for (const pf of pe.fields ?? []) {
+    if (!pf || typeof pf !== 'object' || Array.isArray(pf) ||
+        typeof pf.name !== 'string') {
+      return `profile '${profileName}': every entry in entity '${
+          pe.name}' 'fields' is a mapping with a 'name'`;
+    }
+  }
+  const dupField = duplicateName(pe.fields ?? []);
+  if (dupField) {
+    return `profile '${profileName}': field '${pe.name}.${
+        dupField}' is listed twice`;
+  }
+  // Copy each field so no edit here reaches another entity through a shared
+  // object.
+  le.fields = (le.fields ?? []).map((f: any) => ({...f}));
+  const lByName = indexByName(le.fields);
+  const inherited = inheritedFieldNames(lm, le.name);
+  const rebound = new Set<string>();
+  for (const pf of pe.fields ?? []) {
+    let lf = lByName.get(pf.name);
+    if (!lf && inherited.has(pf.name)) {
+      // Binding an inherited field redeclares it on this entity with only a
+      // binding, which inheritance merges over the ancestor's definition.
+      lf = {name: pf.name};
+      le.fields = [...(le.fields ?? []), lf];
+      lByName.set(pf.name, lf);
+    }
     if (!lf) {
       return `profile '${profileName}': field '${pe.name}.${
           pf.name}' is not in the logical model`;
     }
     const err = mergeField(lf, pf, pe.name, profileName);
     if (err) return err;
+    rebound.add(pf.name);
+  }
+  // An exclusion applies to this entity only. The
+  // caller records it for applyProfileExclusions. A field no entity inherits
+  // from this one also loses its binding here, so it stays unbound even where
+  // the exclusions are not applied; one a descendant inherits keeps the
+  // binding the descendant reads.
+  const inheritedBelow = hasDescendants(lm, le.name);
+  for (const name of pe.fields_exclude ?? []) {
+    const lf = lByName.get(name);
+    if (!lf && !inherited.has(name)) {
+      return `profile '${profileName}': field '${pe.name}.${
+          name}' in 'fields_exclude' is not in the logical model`;
+    }
+    if (rebound.has(name)) {
+      return `profile '${profileName}': field '${pe.name}.${
+          name}' is in both 'fields' and 'fields_exclude'`;
+    }
+    if (lf && !inheritedBelow) {
+      // A line that only redeclares an inherited field goes with its binding,
+      // since a redeclaration with nothing but the name is rejected. The
+      // entity still inherits the declaration.
+      if (inherited.has(name)) {
+        le.fields = le.fields.filter((f: any) => f !== lf);
+      } else {
+        delete lf.expression;
+      }
+    }
   }
   return undefined;
 }
 
+// Whether any entity in the logical document extends `entityName`, directly or
+// through another entity.
+function hasDescendants(lm: any, entityName: string): boolean {
+  const entities = indexByName(lm.entities ?? lm.datasets);
+  return [...entities.keys()].some(
+      name => name !== entityName &&
+          ancestorNames(entities, name).has(entityName));
+}
+
+// The names of every ancestor `entityName`'s `extends` reaches.
+function ancestorNames(
+    entities: Map<string, any>, entityName: string): Set<string> {
+  const seen = new Set<string>();
+  const queue = [...(entities.get(entityName)?.extends ?? [])];
+  while (queue.length) {
+    const anc = queue.shift();
+    if (typeof anc !== 'string' || seen.has(anc)) continue;
+    seen.add(anc);
+    queue.push(...(entities.get(anc)?.extends ?? []));
+  }
+  return seen;
+}
+
+// Overlays a field's binding. The expression may be anything a model field's
+// expression may be -- a column, a computation, or the `dialects:` form.
 function mergeField(lf: any, pf: any, entityName: string, profileName: string):
     string|undefined {
   for (const k of Object.keys(pf)) {
@@ -236,44 +474,104 @@ function mergeField(lf: any, pf: any, entityName: string, profileName: string):
       return declError(profileName, `field '${entityName}.${pf.name}'`, k);
     }
   }
-  if (pf.expression !== undefined) {
-    if (!isBareColumnRef(pf.expression)) {
-      return `profile '${profileName}': field '${entityName}.${
-          pf.name}' expression must be a bare column reference, not arbitrary ` +
-          `SQL; the computation is the logical model's to define`;
-    }
-    lf.expression = pf.expression;
+  // A profile file's entry always has an expression (profileSpecOf rejects one
+  // without). The legacy wrapper form may list a field with none, and it is
+  // removed with that form.
+  if (pf.expression !== undefined) lf.expression = pf.expression;
+  return undefined;
+}
+
+// Overlays relationships' join columns, by relationship name.
+function mergeRelationships(
+    lm: any, relationships: unknown, profileName: string): string|undefined {
+  if (relationships === undefined) return undefined;
+  if (!Array.isArray(relationships)) {
+    return `profile '${profileName}': 'relationships' must be a list`;
   }
-  // A field the profile does not bind keeps no expression -- unbound under this
-  // profile (a field is unbound exactly when it carries no expression).
+  const dup = duplicateName(relationships);
+  if (dup) {
+    return `profile '${profileName}': relationship '${dup}' is listed twice`;
+  }
+  const lByName = indexByName(lm.relationships);
+  for (const pr of relationships) {
+    if (!pr || typeof pr !== 'object') continue;
+    const lr = lByName.get(pr.name);
+    if (!lr) {
+      return `profile '${profileName}': relationship '${
+          pr.name}' is not in the logical model`;
+    }
+    for (const k of Object.keys(pr)) {
+      if (!PROFILE_RELATIONSHIP_KEYS.has(k)) {
+        return declError(profileName, `relationship '${pr.name}'`, k);
+      }
+    }
+    if (pr.from_columns !== undefined) lr.from_columns = pr.from_columns;
+    if (pr.to_columns !== undefined) lr.to_columns = pr.to_columns;
+  }
+  return undefined;
+}
+
+// Records the metrics a profile excludes: `"*"` for every metric, now and
+// later, or a list of metric names. The metrics stay in the document.
+function excludeMetrics(
+    lm: any, exclude: unknown, profileName: string,
+    excluded: ProfileExclusion[]): string|undefined {
+  if (exclude === undefined) return undefined;
+  const record = (names: string[]) => {
+    for (const metric of names) excluded.push({model: lm.name, metric});
+  };
+  if (exclude === '*') {
+    record((lm.metrics ?? []).map((m: any) => m?.name)
+               .filter((n: unknown): n is string => typeof n === 'string'));
+    return undefined;
+  }
+  if (!Array.isArray(exclude)) {
+    return `profile '${profileName}': 'metrics_exclude' must be "*" or a ` +
+        `list of metric names`;
+  }
+  const known = indexByName(lm.metrics);
+  for (const name of exclude) {
+    if (name === '*') {
+      return `profile '${profileName}': 'metrics_exclude' takes "*" on its ` +
+          `own, not inside a list`;
+    }
+    if (!known.has(name)) {
+      return `profile '${profileName}': metric '${
+          name}' in 'metrics_exclude' is not in the logical model`;
+    }
+  }
+  record([...new Set(exclude as string[])]);
   return undefined;
 }
 
 function declError(profileName: string, where: string, key: string): string {
-  return `profile '${profileName}': ${where} sets '${key}', a logical ` +
-      `declaration the model owns; a profile may set only physical bindings ` +
-      `(source, expression, executor, deployment_target)`;
+  return notAllowed(`profile '${profileName}': ${where}`, key);
 }
 
-// A profile's field expression must be a BARE column reference (e.g. `c_name`),
-// never arbitrary SQL: the computation belongs to the logical model, and only
-// the column it reads may vary per profile. Accepts the bare-string form and the
-// per-dialect object; rejects any variant that contains whitespace or a call.
-function isBareColumnRef(expr: unknown): boolean {
-  const parts: string[] = [];
-  if (typeof expr === 'string') {
-    parts.push(expr);
-  } else if (
-      expr && typeof expr === 'object' &&
-      Array.isArray((expr as any).dialects)) {
-    for (const d of (expr as any).dialects) {
-      if (d && typeof d.expression === 'string') parts.push(d.expression);
+function notAllowed(where: string, key: string): string {
+  return `${where} sets '${key}', which a profile may not set; a profile ` +
+      `carries only physical bindings, and the logical model owns everything ` +
+      `else`;
+}
+
+// The names of the fields an entity inherits, from every ancestor its
+// `extends` reaches in the logical document.
+function inheritedFieldNames(lm: any, entityName: string): Set<string> {
+  const entities = indexByName(lm.entities ?? lm.datasets);
+  const names = new Set<string>();
+  const seen = new Set<string>([entityName]);
+  const queue = [...(entities.get(entityName)?.extends ?? [])];
+  while (queue.length) {
+    const anc = queue.shift();
+    if (typeof anc !== 'string' || seen.has(anc)) continue;
+    seen.add(anc);
+    const e = entities.get(anc);
+    for (const f of e?.fields ?? []) {
+      if (f && typeof f.name === 'string') names.add(f.name);
     }
-  } else {
-    return false;
+    queue.push(...(e?.extends ?? []));
   }
-  if (!parts.length) return false;
-  return parts.every(s => !/[\s()]/.test(s.trim()));
+  return names;
 }
 
 function indexByName(list: unknown): Map<string, any> {
@@ -290,19 +588,12 @@ function indexByName(list: unknown): Map<string, any> {
 
 // A `sql` executor carries the write itself, in the bound store's table and
 // column names and its dialect, so it is physical in the way a field's
-// `expression` is, and a model a profile names must leave it to the profile.
-// Inheriting one would be incoherent, not merely untidy:
-// stripInlineFieldExpressions has just cleared this model's inline column
-// bindings so the profile alone decides them, while the inherited statements
-// would still be written against the columns that were cleared.
-//
-// Scoped to the models the profile targets, for the same reason that pass is:
-// a model the profile does not name keeps its inline bindings, and its inline
-// statements are written against those.
-function findLogicalSqlExecutor(doc: any, modelNames: Set<string>):
+// `expression` is, and a model a profile binds must leave it to the profile.
+// Scoped to the models the profile binds: a model the profile does not name
+// keeps its inline statements, written against its inline bindings.
+function findLogicalSqlExecutor(models: any[]):
     {model: string; action: string}|undefined {
-  for (const m of doc.semantic_model ?? []) {
-    if (!m || typeof m !== 'object' || !modelNames.has(m.name)) continue;
+  for (const m of models) {
     for (const a of m.actions ?? []) {
       if (a && typeof a === 'object' && a.executor &&
           typeof a.executor === 'object' && a.executor.sql !== undefined) {
@@ -313,49 +604,37 @@ function findLogicalSqlExecutor(doc: any, modelNames: Set<string>):
   return undefined;
 }
 
-// A profile is authoritative for a model's physical bindings, so a field is
-// bound under the merged model only if the profile binds it. This clears every
-// inline field expression from the logical clone before the profile is
-// overlaid, so a field the profile does not bind is left unbound (§7.3,
-// "omitted is unbound"). Only the per-field column binding is cleared; the
-// logical model's meaning -- names, types, relationships, metric formulas -- is
-// untouched. A field is unbound exactly when it carries no expression; there is
-// no separate flag.
-function stripInlineFieldExpressions(doc: any, modelNames: Set<string>): void {
-  for (const m of doc.semantic_model ?? []) {
-    if (!m || typeof m !== 'object' || !modelNames.has(m.name)) continue;
-    const entities = m.entities ?? m.datasets ?? [];
-    for (const e of entities) {
-      if (!e || typeof e !== 'object' || !Array.isArray(e.fields)) continue;
-      for (const f of e.fields) {
-        if (f && typeof f === 'object') delete f.expression;
-      }
-    }
-  }
-}
-
 
 // One profile's availability outcome: the fields it leaves unbound, and the
 // building blocks that fall with them.
 export interface AvailabilityReport {
   profile: string;
   unboundFields: string[];  // "Entity.field"
-  // An entity dropped whole because its key names an unbound field: a graph node
-  // must be keyed, so an unbound key makes the entire entity unavailable.
+  // No pruning rule drops an entity or a relationship, so droppedEntities and
+  // droppedRelationships are always empty (see the file header).
   droppedEntities: {name: string; reason: string}[];
   droppedMetrics: {name: string; reason: string}[];
   droppedRelationships: {name: string; reason: string}[];
-  // An action this profile cannot perform: it binds no executor for it, or a
-  // concept the action names is itself unavailable.
+  // An action this profile cannot perform: it binds no executor for it.
   droppedActions: {name: string; reason: string}[];
+  // A bound field that reads an unavailable field of its entity, directly or
+  // through other fields, so it cannot be computed either. "Entity.field".
+  droppedFields: {name: string; reason: string}[];
+  // A field or metric whose SQL the parser cannot read, so the fields that SQL
+  // reads were not checked. A metric is kept; a field is judged on what could
+  // be read.
+  warnings: string[];
 }
 
 /**
  * Returns a clone of `model` reduced to what `profileName` can answer: unbound
- * fields removed from their entities, and every metric or relationship that
- * depends on an unbound field dropped. The input is never mutated. The report
- * names each dropped block and the unbound field that stops it, so a caller can
- * state the withheld coverage. A model with nothing unbound resolves unchanged.
+ * and excluded fields taken off their entities, with every field that reads
+ * one of them, directly or through other fields; every excluded metric and
+ * every metric that reads an unavailable field dropped; and every action with
+ * no executor dropped. A field counts whether the entity declares or inherits
+ * it. The input is never mutated. The report names each dropped block and the unbound field that
+ * stops it, so a caller can state the withheld coverage. A model with nothing
+ * unbound resolves unchanged.
  */
 export function pruneUnavailable(model: SemanticModel, profileName: string):
     {model: SemanticModel; report: AvailabilityReport} {
@@ -367,99 +646,151 @@ export function pruneUnavailable(model: SemanticModel, profileName: string):
     droppedMetrics: [],
     droppedRelationships: [],
     droppedActions: [],
+    droppedFields: [],
+    warnings: [],
   };
 
   // A field is bound when isFieldBound says so; otherwise it is unbound
   // (structurally absent under this profile). isFieldBound is the shared
   // predicate the generator also uses, so a field awaiting transpilation (its
   // column carried on the imported expression) counts as bound, not dropped.
+  //
+  // Availability is judged on each entity's resolved fields, declared plus
+  // inherited, since a metric can read an inherited field as readily as a
+  // declared one. A field the profile excludes on an entity is unavailable on
+  // that entity.
   const unbound = new Set<string>();
-  for (const e of clone.entities ?? []) {
+  const resolved = resolvedEntities(clone);
+  for (const e of resolved) {
     // An abstract entity has no table and no bindings by design: it survives
     // only as a label on its subtypes (which bind its inherited fields on their
     // own tables). Its fields are legitimately column-less, so they are not
-    // "unbound" in the pruning sense -- skip them so the entity is not dropped
-    // and its field names remain to define the shared label's signature.
+    // "unbound" in the pruning sense.
     if (e.abstract) continue;
     for (const f of e.fields ?? []) {
       if (!isFieldBound(f)) unbound.add(`${e.name}.${f.name}`);
     }
+    for (const name of e.excludedFields ?? []) {
+      unbound.add(`${e.name}.${name}`);
+    }
   }
   report.unboundFields = [...unbound];
 
-  // An entity whose key names an unbound field cannot be a node -- a graph node
-  // must be keyed -- so the WHOLE entity is unavailable and everything on it (its
-  // relationships and the metrics over it) falls with it. This is availability
-  // propagating up from the unbound key. Record the entity, and add every one of
-  // its fields to the unbound set so the relationship and metric passes below
-  // cascade over it. Entity names are captured before any drop so a metric or
-  // relationship that references a dropped entity is still detected.
-  const allEntityNames = (clone.entities ?? []).map(e => e.name);
-  const unavailableEntities = new Set<string>();
-  for (const e of clone.entities ?? []) {
-    const missingKey =
-        (e.keys ?? []).find(k => unbound.has(`${e.name}.${k}`));
-    if (missingKey !== undefined) {
-      unavailableEntities.add(e.name);
-      report.droppedEntities.push(
-          {name: e.name, reason: `key field ${missingKey} is unbound`});
-      for (const f of e.fields ?? []) unbound.add(`${e.name}.${f.name}`);
+  // A field that reads an unavailable field of its entity is unavailable too,
+  // and so is every field and metric that reads it in turn. Each field's
+  // dependencies are read once, and only when something is unbound.
+  const unavailable = new Set(unbound);
+  const unreadable = new Set<string>();
+  const dependencies = new Map<string, string[]>();
+  if (unbound.size) {
+    for (const e of resolved) {
+      if (e.abstract) continue;
+      for (const f of e.fields ?? []) {
+        const key = `${e.name}.${f.name}`;
+        if (unbound.has(key)) continue;
+        dependencies.set(
+            key,
+            fieldDependencies(clone, e.name, f.name, unreadable)
+                .map(dep => `${e.name}.${dep}`));
+      }
     }
   }
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [key, deps] of dependencies) {
+      if (unavailable.has(key)) continue;
+      const reached = deps.find(target => unavailable.has(target));
+      if (reached) {
+        unavailable.add(key);
+        report.droppedFields.push(
+            {name: key, reason: `reads ${reached}, which is unavailable`});
+        grew = true;
+      }
+    }
+  }
+  for (const what of unreadable) {
+    report.warnings.push(
+        `${what}: kcmd could not read its SQL, so the fields it reads were ` +
+        `not checked`);
+  }
 
-  // Drop unavailable entities whole, then drop unbound fields from the entities
-  // that remain. (A bound field whose value is null still emits a column --
-  // unbound is not null.)
-  clone.entities =
-      (clone.entities ?? []).filter(e => !unavailableEntities.has(e.name));
-  for (const e of clone.entities) {
+  // Keys and join columns are physical column names, not fields, so whether a
+  // field is bound says nothing about them. Excluding a field that happens to
+  // share a key column's name drops the field and nothing else.
+  const allEntityNames = (clone.entities ?? []).map(e => e.name);
+
+  // Take unbound and excluded fields off the entities that declare them. (A
+  // bound field whose value is null still emits a column -- unbound is not
+  // null.) A declaration that a descendant inherits stays, so the descendant
+  // keeps the definition and whatever binding it has, and is marked excluded on
+  // the declaring entity instead, since a binding is a fact about one table.
+  const extendedNames = new Set(
+      resolvedEntities(clone).flatMap(e => e.extends ?? []));
+  for (const e of clone.entities ?? []) {
     // Keep an abstract entity's fields intact: they are column-less by design
     // and name the shared label's property set for the emitter (see above).
     if (e.abstract) continue;
-    e.fields = (e.fields ?? []).filter(isFieldBound);
-  }
-
-  // A relationship is available only when both endpoint entities are available
-  // and the join columns on both ends are bound (its endpoints' `columns` name
-  // fields on those entities).
-  const keptRels: Relationship[] = [];
-  for (const r of clone.relationships ?? []) {
-    const deadEnd = [r.source.entity, r.destination.entity].find(
-        n => unavailableEntities.has(n));
-    if (deadEnd !== undefined) {
-      report.droppedRelationships.push(
-          {name: r.name, reason: `entity ${deadEnd} is unavailable`});
-      continue;
-    }
-    const missing = unboundJoinField(r, unbound);
-    if (missing) {
-      report.droppedRelationships.push(
-          {name: r.name, reason: `join column ${missing} is unbound`});
+    // An inherited field that is unavailable on this entity is marked excluded
+    // here, whether it is unbound, excluded, or reads such a field. Removing
+    // this entity's line alone, or having none to remove, would let inheritance
+    // hand back the ancestor's definition and binding.
+    const inheritedUnavailable = [...inheritedNamesOf(clone, e.name)].filter(
+        name => unavailable.has(`${e.name}.${name}`));
+    const excluded = new Set(e.excludedFields ?? []);
+    const gone = (f: Field) => !isFieldBound(f) || excluded.has(f.name) ||
+        unavailable.has(`${e.name}.${f.name}`);
+    if (extendedNames.has(e.name)) {
+      const kept = (e.fields ?? []).filter(gone).map(f => f.name);
+      if (kept.length) {
+        e.excludedFields = [...new Set([...excluded, ...kept])];
+      }
     } else {
-      keptRels.push(r);
+      e.fields = (e.fields ?? []).filter(f => !gone(f));
+    }
+    if (inheritedUnavailable.length) {
+      e.excludedFields =
+          [...new Set([...(e.excludedFields ?? []), ...inheritedUnavailable])];
     }
   }
-  clone.relationships = keptRels;
 
-  // A metric is available only when no entity it spans is unavailable, every
-  // field it references is bound, and -- when it spans entities -- a relationship
-  // connecting them survives.
+  // A relationship's join columns are its own binding, so pruning fields never
+  // removes one.
+  const keptRels: Relationship[] = clone.relationships ?? [];
+
+  // A metric is available only when the profile does not exclude it, every
+  // field it reads is available, and -- when it spans entities -- a
+  // relationship connects them.
+  const excludedMetrics = new Set(clone.excludedMetrics ?? []);
+  delete clone.excludedMetrics;
   const keptMetrics: Metric[] = [];
   for (const mt of clone.metrics ?? []) {
-    const expr = mt.expression ?? '';
-    const refs = referencedEntityNames(expr, allEntityNames);
-    const deadEntity = refs.find(n => unavailableEntities.has(n));
-    if (deadEntity !== undefined) {
-      report.droppedMetrics.push(
-          {name: mt.name, reason: `entity ${deadEntity} is unavailable`});
+    if (excludedMetrics.has(mt.name)) {
+      report.droppedMetrics.push({name: mt.name, reason: 'excluded'});
       continue;
     }
-    const hit = firstUnboundReferenced(expr, unbound);
+    const columns: SqlColumn[] = [];
+    const sources = expressionSources(mt);
+    let unread = 0;
+    for (const {text, dialect} of sources) {
+      const read = columnReferences(text, dialect);
+      if (read) {
+        columns.push(...read);
+      } else {
+        unread++;
+      }
+    }
+    const hit = firstUnboundReferenced(columns, unavailable);
     if (hit) {
-      report.droppedMetrics.push(
-          {name: mt.name, reason: `field ${hit} is unbound`});
+      report.droppedMetrics.push({
+        name: mt.name,
+        reason: `field ${hit} is ${unbound.has(hit) ? 'unbound' : 'unavailable'}`,
+      });
       continue;
     }
+    const refs = [...new Set(
+        columns.map(c => c.qualifier)
+            .filter((q): q is string => !!q && allEntityNames.includes(q)))];
     if (refs.length > 1 && !connectingRelationshipKept(refs, keptRels)) {
       report.droppedMetrics.push({
         name: mt.name,
@@ -467,37 +798,28 @@ export function pruneUnavailable(model: SemanticModel, profileName: string):
       });
       continue;
     }
+    // A text the parser cannot read is skipped, so what it reads is unknown.
+    if (unread) {
+      report.warnings.push(
+          unread === sources.length ?
+              `metric '${mt.name}': kcmd could not read its SQL, so the ` +
+                  `fields it reads were not checked` :
+              `metric '${mt.name}': kcmd could not read some of its SQL, so ` +
+                  `the fields that SQL reads were not checked`);
+    }
     keptMetrics.push(mt);
   }
   clone.metrics = keptMetrics;
 
-  // An action is available only where a binding performs it and every concept
-  // it names survives. The executor is the action's binding, so an action
-  // without one is unavailable for the same reason a column-less field is: it
-  // is declared, and there is nothing here to carry it out.
-  const droppedRels = new Set(report.droppedRelationships.map(d => d.name));
+  // An action is available only where a binding performs it. The executor is
+  // the action's binding, so an action without one is unavailable for the same
+  // reason a column-less field is: it is declared, and there is nothing here to
+  // carry it out.
   const keptActions: Action[] = [];
   for (const a of clone.actions ?? []) {
     if (a.executor === undefined) {
       report.droppedActions.push(
           {name: a.name, reason: 'no executor is bound under this profile'});
-      continue;
-    }
-    // Parameters are not tested. Every one is a scalar, and a parameter
-    // projected from a field took a copy of that field's type and wording when
-    // the model loaded -- it needs nothing at run time from the concept it was
-    // projected from. So a profile that leaves that concept unavailable leaves
-    // the parameter intact, and dropping the action over it would withhold a
-    // write the binding is perfectly able to perform.
-    const deadAffected = (a.affects ?? [])
-                             .find(
-                                 f => unavailableEntities.has(f.concept) ||
-                                     droppedRels.has(f.concept));
-    if (deadAffected !== undefined) {
-      report.droppedActions.push({
-        name: a.name,
-        reason: `it affects ${deadAffected.concept}, which is unavailable`,
-      });
       continue;
     }
     keptActions.push(a);
@@ -507,39 +829,67 @@ export function pruneUnavailable(model: SemanticModel, profileName: string):
   return {model: clone, report};
 }
 
-// The first unbound "Entity.field" a metric expression references (qualified),
-// or null. Text inside string literals is ignored.
-function firstUnboundReferenced(expr: string, unbound: Set<string>): string|
-    null {
-  const scannable = blankStringLiterals(expr);
+// Each entity resolved for inheritance, or as declared when the hierarchy is
+// broken, which push reports elsewhere. `extends` is expanded to every
+// ancestor.
+function resolvedEntities(model: SemanticModel): Entity[] {
+  const entities = model.entities ?? [];
+  if (!entities.some(e => e.extends?.length)) return entities;
+  try {
+    return resolveInheritance(model).model.entities ?? entities;
+  } catch {
+    return entities;
+  }
+}
+
+// The names of the fields `entityName` inherits from every ancestor its
+// `extends` reaches.
+function inheritedNamesOf(model: SemanticModel, entityName: string):
+    Set<string> {
+  const byName = new Map((model.entities ?? []).map(e => [e.name, e]));
+  const names = new Set<string>();
+  const seen = new Set<string>([entityName]);
+  const queue = [...(byName.get(entityName)?.extends ?? [])];
+  while (queue.length) {
+    const ancestor = queue.shift()!;
+    if (seen.has(ancestor)) continue;
+    seen.add(ancestor);
+    for (const f of byName.get(ancestor)?.fields ?? []) names.add(f.name);
+    queue.push(...(byName.get(ancestor)?.extends ?? []));
+  }
+  return names;
+}
+
+// The first unbound "Entity.field" among the columns a metric expression
+// reads, or null.
+function firstUnboundReferenced(columns: SqlColumn[], unbound: Set<string>):
+    string|null {
   for (const key of unbound) {
     const dot = key.indexOf('.');
-    const entity = key.slice(0, dot);
-    const field = key.slice(dot + 1);
-    const re = new RegExp(`(?<![\\w\`])\`?${escapeRegExp(entity)}\`?\\.\`?${
-        escapeRegExp(field)}\`?(?![\\w])`);
-    if (re.test(scannable)) return key;
+    if (fieldsReadOn(columns, key.slice(0, dot)).includes(key.slice(dot + 1))) {
+      return key;
+    }
   }
   return null;
 }
 
-// The first join field of a relationship that is unbound on its own end, or
-// null when both ends' join columns are bound.
-function unboundJoinField(r: Relationship, unbound: Set<string>): string|null {
-  for (const c of r.source?.columns ?? []) {
-    const key = `${r.source.entity}.${c}`;
-    if (unbound.has(key)) return key;
+// The dialect `text` is written in on `f`: the dialect of the list entry that
+// holds it, the imported dialect for the imported text, and BigQuery
+// otherwise, since the loader fills `expression` from a `BIGQUERY` or
+// `ANSI_SQL` entry.
+function dialectOf(
+    f: Pick<Field, 'dialects'|'importedExpression'|'importedDialect'>,
+    text: string): string {
+  const entry = f.dialects?.find(d => d.expression === text);
+  if (entry) return entry.dialect;
+  if (text === f.importedExpression && f.importedDialect) {
+    return f.importedDialect;
   }
-  for (const c of r.destination?.columns ?? []) {
-    const key = `${r.destination.entity}.${c}`;
-    if (unbound.has(key)) return key;
-  }
-  return null;
+  return 'BIGQUERY';
 }
 
-// Whether any surviving relationship directly connects two of the referenced
-// entities -- the minimal check that a cross-entity metric still has a join path
-// after unavailable relationships were dropped.
+// Whether any relationship directly connects two of the referenced entities --
+// the minimal check that a cross-entity metric has a join path.
 function connectingRelationshipKept(
     refEntities: string[], kept: Relationship[]): boolean {
   const set = new Set(refEntities);
@@ -557,16 +907,16 @@ function connectingRelationshipKept(
  * returns `error` for the caller to surface.
  */
 export function mergeProfileOntoDoc(
-    logicalText: string, profileText: string,
-    profileName: string): {text: string; warnings: string[]}|{
-  error: string
-}
-{
+    logicalText: string, profileText: string, profileName: string):
+    {text: string; warnings: string[]; excluded: ProfileExclusion[]}|
+    {error: string} {
   let logicalDoc: unknown;
   let profileDoc: unknown;
   try {
-    logicalDoc = yaml.parse(logicalText);
-    profileDoc = yaml.parse(profileText);
+    // Parse as the loader does, so a YAML-only tag such as `!!timestamp` in a
+    // custom ai_context member stays the text written through the merge.
+    logicalDoc = yaml.parse(logicalText, YAML_OPTIONS);
+    profileDoc = yaml.parse(profileText, YAML_OPTIONS);
   } catch (err: any) {
     return {
       error: `could not parse the model or profile '${profileName}': ${
@@ -575,5 +925,907 @@ export function mergeProfileOntoDoc(
   }
   const merged = mergeProfile(logicalDoc, profileDoc, profileName);
   if (merged.error) return {error: merged.error};
-  return {text: yaml.stringify(merged.doc), warnings: merged.warnings};
+  return {
+    text: yaml.stringify(merged.doc),
+    warnings: merged.warnings,
+    excluded: merged.excluded,
+  };
 }
+
+
+/**
+ * Reads a profile file -- the top-level profile object `mergeProfile` also
+ * accepts -- into the IR's `ProfileSpec`. Throws on anything a profile may not
+ * say: an unknown key at any level, a value of the wrong shape, a field in both
+ * `fields` and `fields_exclude`, `"*"` inside a `metrics_exclude` list, or a
+ * `name` other than `profileName`. A field expression's short form means
+ * `ANSI_SQL`, so it becomes a one-entry `ANSI_SQL` list with `stringForm` set,
+ * and the `dialects:` form is kept as written. An action's executor is carried through as the loader reads one;
+ * actions are out of scope for the preview, so nothing more is checked.
+ */
+export function loadProfileFile(text: string, profileName: string):
+    ProfileSpec {
+  let doc: any;
+  try {
+    doc = yaml.parse(text, YAML_OPTIONS);
+  } catch (err: any) {
+    throw new Error(
+        `profile '${profileName}' does not parse: ${err?.message ?? err}`);
+  }
+  return profileSpecOf(doc, profileName);
+}
+
+// Reads a parsed profile file into a ProfileSpec, throwing on anything a
+// profile may not say. Shared by loadProfileFile and by the merge push runs,
+// so the two agree on what a valid profile file is.
+function profileSpecOf(doc: any, profileName: string): ProfileSpec {
+  const where = `profile '${profileName}'`;
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc) ||
+      doc.semantic_model !== undefined) {
+    throw new Error(`${where} is not a profile file`);
+  }
+  if (doc.version !== undefined) {
+    throw new Error(
+        `${where} sets 'version'; a profile file takes its version from the ` +
+        `model file beside it, so remove the line`);
+  }
+  // The profile's own name is checked against the file name below.
+  requireKeys(doc, PROFILE_FILE_KEYS, where, false);
+  if (doc.name !== profileName) {
+    throw new Error(
+        `${where} declares name '${doc.name ?? ''}', which does not match ` +
+        `its file's profile name '${profileName}'`);
+  }
+  const spec: ProfileSpec = {
+    name: profileName,
+    entities: namedListOf(doc.entities, `${where} 'entities'`)
+                  .map(e => profileEntity(e, where)),
+    relationships:
+        namedListOf(doc.relationships, `${where} 'relationships'`).map(r => {
+          requireKeys(r, PROFILE_RELATIONSHIP_KEYS, `${where}: relationship`);
+          const at = `${where}: relationship '${r.name}'`;
+          // A side the profile leaves out is empty, which completeness
+          // rejects: a named profile states both join column lists itself.
+          const binding: ProfileRelationshipBinding = {
+            name: r.name,
+            fromColumns: stringList(r.from_columns, `${at} 'from_columns'`),
+            toColumns: stringList(r.to_columns, `${at} 'to_columns'`),
+          };
+          return binding;
+        }),
+  };
+  if (doc.metrics_exclude !== undefined) {
+    const ex = doc.metrics_exclude;
+    if (ex !== '*' &&
+        !(Array.isArray(ex) &&
+          ex.every((n: unknown) => typeof n === 'string'))) {
+      throw new Error(
+          `${where}: 'metrics_exclude' must be "*" or a list of metric names`);
+    }
+    if (Array.isArray(ex) && ex.includes('*')) {
+      throw new Error(
+          `${where}: 'metrics_exclude' takes "*" on its own, not inside a ` +
+          `list`);
+    }
+    spec.metricsExclude = ex;
+  }
+  if (doc.actions !== undefined) {
+    // Actions are out of preview scope and gain no new checks, so a repeated
+    // action is taken as the merge has always taken one: the last entry wins.
+    spec.actions = listOf(doc.actions, `${where} 'actions'`).map(a => {
+      requireKeys(a, PROFILE_ACTION_KEYS, `${where}: action`);
+      if (a.executor === undefined) return {name: a.name};
+      return {
+        name: a.name,
+        executor: a.executor === null ? null : profileExecutor(a.executor),
+      };
+    });
+  }
+  return spec;
+}
+
+function profileEntity(e: any, where: string): ProfileEntityBinding {
+  requireKeys(e, PROFILE_ENTITY_KEYS, `${where}: entity`);
+  const at = `${where}: entity '${e.name}'`;
+  const binding: ProfileEntityBinding = {name: e.name};
+  if (e.source !== undefined) {
+    if (typeof e.source !== 'string') {
+      throw new Error(`${at} 'source' must be a string`);
+    }
+    binding.source = e.source;
+  }
+  if (e.primary_key !== undefined) {
+    binding.primaryKey = stringList(e.primary_key, `${at} 'primary_key'`);
+  }
+  if (e.unique_keys !== undefined) {
+    binding.uniqueKeys = listOf(e.unique_keys, `${at} 'unique_keys'`)
+                             .map(k => stringList(k, `${at} 'unique_keys'`));
+  }
+  if (e.fields !== undefined) {
+    binding.fields = namedListOf(e.fields, `${at} 'fields'`).map(f => {
+      requireKeys(f, PROFILE_FIELD_KEYS, `${at}: field`);
+      const fat = `${at}: field '${f.name}'`;
+      if (f.expression === undefined) {
+        throw new Error(
+            `${fat} has no 'expression'; bind it with one, or list it in ` +
+            `'fields_exclude'`);
+      }
+      return {name: f.name, ...profileExpression(f.expression, fat)};
+    });
+  }
+  if (e.fields_exclude !== undefined) {
+    binding.fieldsExclude =
+        stringList(e.fields_exclude, `${at} 'fields_exclude'`);
+    const both = binding.fieldsExclude.filter(
+        n => (binding.fields ?? []).some(f => f.name === n));
+    if (both.length) {
+      throw new Error(
+          `${at}: field '${both[0]}' is in both 'fields' and 'fields_exclude'`);
+    }
+  }
+  return binding;
+}
+
+// Checks that `obj` is a mapping carrying only `allowed` keys and, unless
+// `named` is false, a string `name`.
+function requireKeys(
+    obj: any, allowed: Set<string>, where: string, named = true): void {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    throw new Error(`${where} is not a mapping`);
+  }
+  if (named && typeof obj.name !== 'string') {
+    throw new Error(`${where} has no 'name'`);
+  }
+  for (const k of Object.keys(obj)) {
+    if (!allowed.has(k)) {
+      throw new Error(notAllowed(
+          named && obj.name !== undefined ? `${where} '${obj.name}'` : where,
+          k));
+    }
+  }
+}
+
+function listOf(value: unknown, where: string): any[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${where} must be a list`);
+  return value;
+}
+
+// A list of named entries, each named once.
+function namedListOf(value: unknown, where: string): any[] {
+  const list = listOf(value, where);
+  const dup = duplicateName(list);
+  if (dup) throw new Error(`${where} lists '${dup}' twice`);
+  return list;
+}
+
+function stringList(value: unknown, where: string): string[] {
+  const list = listOf(value, where);
+  if (!list.every(v => typeof v === 'string')) {
+    throw new Error(`${where} must be a list of names`);
+  }
+  return list;
+}
+
+// The IR form of a profile field's expression. Dialect names match exactly, and the engine-specific entry wins over
+// ANSI_SQL for `expression`. A list with neither keeps its first entry as the
+// imported expression, so the field still counts as bound (see
+// `isFieldBound`).
+function profileExpression(expr: unknown, where: string):
+    Pick<
+        Field,
+        'expression'|'dialects'|'stringForm'|'importedExpression'|
+        'importedDialect'> {
+  if (expr === undefined) return {};
+  if (typeof expr === 'string') {
+    return {
+      expression: expr,
+      dialects: [{dialect: 'ANSI_SQL', expression: expr}],
+      stringForm: true,
+    };
+  }
+  const dialects = (expr as any)?.dialects;
+  if (!Array.isArray(dialects) || !dialects.length ||
+      !dialects.every(
+          (d: any) => typeof d?.dialect === 'string' &&
+              typeof d?.expression === 'string')) {
+    throw new Error(
+        `${where}: 'expression' must be a string or a list of dialects`);
+  }
+  // Only the allowlisted dialects, each at most once, spelled exactly as the
+  // allowlist spells them.
+  const list: DialectExpression[] = [];
+  for (const d of dialects) {
+    const dialect = d.dialect;
+    if (!(ALLOWED_DIALECTS as readonly string[]).includes(dialect)) {
+      throw new Error(
+          `${where}: dialect '${d.dialect}' is not one of ${
+              ALLOWED_DIALECTS.join(', ')}`);
+    }
+    if (list.some(x => x.dialect === dialect)) {
+      throw new Error(`${where}: dialect '${dialect}' appears twice`);
+    }
+    list.push({dialect: dialect as SqlDialect, expression: d.expression});
+  }
+  const pick = list.find(d => d.dialect === 'BIGQUERY') ??
+      list.find(d => d.dialect === 'ANSI_SQL');
+  const first = list[0];
+  return {
+    ...(pick ? {expression: pick.expression} :
+               first ? {
+                 importedExpression: first.expression,
+                 importedDialect: first.dialect,
+               } :
+                       {}),
+    dialects: list,
+    stringForm: false,
+  };
+}
+
+// An action executor as the loader reads one (see convertExecutor in
+// loader.ts): exactly one of mcp, rest, grpc or sql.
+function profileExecutor(ex: any): Executor {
+  if (ex?.mcp) return {kind: 'mcp', mcp: {...ex.mcp}};
+  if (ex?.rest) return {kind: 'rest', rest: {...ex.rest}};
+  if (ex?.grpc) return {kind: 'grpc', grpc: {...ex.grpc}};
+  if (ex?.sql && Array.isArray(ex.sql.statements)) {
+    return {
+      kind: 'sql',
+      sql: {statements: ex.sql.statements.map((t: string) => String(t).trim())},
+    };
+  }
+  throw new Error(
+      `an action executor must be one of 'mcp', 'rest', 'grpc' or 'sql'`);
+}
+
+
+// ---------------------------------------------------------------------------
+// Whether a profile can be deployed.
+// ---------------------------------------------------------------------------
+
+
+// The database a profile source lives in, for the one-database rule, or
+// undefined when the source is in no accepted form: a bare name, a query, a
+// graph rather than a table, a catalog name under a prefix kcmd does not
+// accept, or one with the wrong number of segments. The
+// result starts with its system, which DIALECT_OF_SYSTEM maps to the dialect
+// the source infers.
+//
+// A database is what a single query can reach: all of BigQuery, BigLake
+// included because BigQuery reads it; one Spanner, AlloyDB, Cloud SQL for
+// PostgreSQL or self-managed PostgreSQL database; one Cloud SQL for MySQL
+// instance or self-managed MySQL server; one Snowflake account; one Databricks
+// metastore. A self-managed server is named by its DNS name, so `mysql:` and
+// `postgresql:` name different systems from `cloudsql_mysql:` and
+// `cloudsql_postgresql:`. The segment counts are those of the Knowledge
+// Catalog FQN reference.
+function databaseOf(source: string): string|undefined {
+  if (/^\/\/bigquery\.googleapis\.com\/projects\/[^/]+\/datasets\/[^/]+\/tables\/[^/]+$/
+          .test(source) ||
+      /^\/\/biglake\.googleapis\.com\/projects\/[^/]+\/catalogs\/[^/]+\/namespaces\/[^/]+\/tables\/[^/]+$/
+          .test(source)) {
+    return 'bigquery';
+  }
+  let m = source.match(
+      /^\/\/spanner\.googleapis\.com\/projects\/([^/]+)\/instances\/([^/]+)\/databases\/([^/]+)\/tables\/[^/]+$/);
+  if (m) return `spanner/${m[1]}/${m[2]}/${m[3]}`;
+  // An AlloyDB database belongs to its cluster, and a table to a schema in it.
+  m = source.match(
+      /^\/\/alloydb\.googleapis\.com\/projects\/([^/]+)\/locations\/([^/]+)\/clusters\/([^/]+)\/databases\/([^/]+)\/schemas\/[^/]+\/tables\/[^/]+$/);
+  if (m) return `alloydb/${m[1]}/${m[2]}/${m[3]}/${m[4]}`;
+  m = source.match(/^(databricks:table|[a-z_]+):(.+)$/);
+  if (!m) return undefined;
+  // A subtype after the prefix, such as `graph:` in `bigquery:graph:p.d.g`,
+  // names something other than a table.
+  if (/^[a-z_]+:/.test(m[2])) return undefined;
+  const seg = catalogNameSegments(m[2]);
+  const first = (n: number) => seg.slice(0, n).join('.');
+  switch (m[1]) {
+    case 'bigquery':
+      return seg.length === 3 ? 'bigquery' : undefined;
+    case 'spanner':
+      return seg.length === 5 ? `spanner/${seg[0]}/${seg[2]}/${seg[3]}` :
+                                undefined;
+    case 'alloydb':
+      return seg.length === 6 ?
+          `alloydb/${seg[0]}/${seg[1]}/${seg[2]}/${seg[3]}` :
+          undefined;
+    case 'cloudsql_mysql':
+      return seg.length === 5 ? `cloudsql_mysql/${first(3)}` : undefined;
+    case 'mysql':
+      return seg.length === 3 ? `mysql/${first(1)}` : undefined;
+    case 'cloudsql_postgresql':
+      return seg.length === 6 ? `cloudsql_postgresql/${first(4)}` : undefined;
+    case 'postgresql':
+      return seg.length === 4 ? `postgresql/${first(2)}` : undefined;
+    case 'snowflake':
+      return seg.length === 4 ? `snowflake/${seg[0]}` : undefined;
+    case 'databricks:table':
+      return seg.length === 4 ? `databricks/${seg[0]}` : undefined;
+    default:
+      return undefined;
+  }
+}
+
+// The dialect each system's sources infer, keyed by the
+// system databaseOf puts first.
+const DIALECT_OF_SYSTEM: Record<string, string> = {
+  bigquery: 'BIGQUERY',
+  spanner: 'SPANNER',
+  alloydb: 'ALLOYDB',
+  cloudsql_mysql: 'MYSQL',
+  mysql: 'MYSQL',
+  cloudsql_postgresql: 'POSTGRES',
+  postgresql: 'POSTGRES',
+  snowflake: 'SNOWFLAKE',
+  databricks: 'DATABRICKS',
+};
+
+// Whether a bound field has a text an engine of `dialect` can run: an entry
+// for that dialect, or a text that matches every engine, which is an ANSI_SQL
+// entry or the string form. A field read without its dialect
+// list keeps its BigQuery or ANSI_SQL text in `expression` with nothing saying
+// which, so that text counts.
+function runsOn(f: Field, dialect: string): boolean {
+  if (f.stringForm) return true;
+  if (f.dialects?.length) {
+    return f.dialects.some(d => {
+      const name = d.dialect.toUpperCase();
+      return name === dialect || name === 'ANSI_SQL';
+    });
+  }
+  if (f.expression !== undefined) return true;
+  return f.importedDialect?.toUpperCase() === dialect;
+}
+
+// A catalog name's dot-separated segments. A segment containing a reserved
+// character, such as a domain-scoped project, is wrapped in backticks, so the
+// dots inside backticks do not split.
+function catalogNameSegments(path: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quoted = false;
+  for (let i = 0; i < path.length; i++) {
+    const ch = path[i];
+    if (ch === '`') {
+      // A doubled backtick inside a quoted segment is a literal backtick.
+      if (quoted && path[i + 1] === '`') {
+        cur += '`';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (ch === '.' && !quoted) {
+      out.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+// Each text a field's or metric's expression carries, with the dialect it is
+// written in.
+function expressionSources(
+    f: Pick<
+        Field,
+        'expression'|'dialects'|'importedExpression'|'importedDialect'>):
+    Array<{text: string; dialect: string}> {
+  const out: Array<{text: string; dialect: string}> = (f.dialects ?? []).map(
+      d => ({text: d.expression, dialect: d.dialect}));
+  for (const text of [f.expression, f.importedExpression]) {
+    if (text !== undefined && !out.some(o => o.text === text)) {
+      out.push({text, dialect: dialectOf(f, text)});
+    }
+  }
+  return out;
+}
+
+/**
+ * Returns one message per reason `profile` cannot be deployed against
+ * `baseModel`, or an empty list. Checks a single profile: nothing unknown,
+ * every concrete entity bound and all in one database, key shapes matching the
+ * model file's where it states keys, every relationship bound, every field the
+ * model file leaves unbound accounted for, and exclusions closed under
+ * dependency, metrics included. Rules that compare profiles with each other
+ * are in validateProfileConsistency. An expression the SQL parser cannot read
+ * is skipped by the rules that read references, with a message in `warnings`.
+ */
+export function validateProfileCompleteness(
+    baseModel: SemanticModel, profile: ProfileSpec,
+    warnings: string[] = []): string[] {
+  const errors: string[] = [];
+  // "field 'Entity.field'" or "metric 'name'", for each expression the parser
+  // cannot read, reported once.
+  const unreadable = new Set<string>();
+  const at = `profile '${profile.name}'`;
+  const entities = baseModel.entities ?? [];
+  const byName = new Map(entities.map(e => [e.name, e]));
+  // Declared plus inherited fields, in the model file and as this profile sees
+  // the model (see withProfile): the profile's bindings applied, and each
+  // excluded field left off the entity that names it. A broken hierarchy in
+  // the model file is reported by push; one the profile itself creates, by
+  // binding a field on two unrelated branches, is reported here.
+  const fieldsOf = fieldsByEntity(baseModel);
+  const profiled = withProfile(baseModel, profile);
+  const profiledError = inheritanceErrorOf(profiled);
+  if (profiledError && !inheritanceErrorOf(baseModel)) {
+    errors.push(`${at}: ${profiledError}`);
+    return errors;
+  }
+  const seenOf = fieldsByEntity(profiled);
+  const bindingOf = new Map(profile.entities.map(e => [e.name, e]));
+
+  // Nothing unknown.
+  for (const pe of profile.entities) {
+    const e = byName.get(pe.name);
+    if (!e) {
+      errors.push(`${at}: entity '${pe.name}' is not in the model`);
+      continue;
+    }
+    if (e.abstract) {
+      errors.push(
+          `${at}: entity '${pe.name}' is abstract, so a profile cannot ` +
+          `bind it`);
+      continue;
+    }
+    const known = fieldsOf.get(pe.name)!;
+    const named = [
+      ...(pe.fields ?? []).map(f => f.name), ...(pe.fieldsExclude ?? []),
+    ];
+    for (const name of named) {
+      if (!known.has(name)) {
+        errors.push(`${at}: field '${pe.name}.${name}' is not in the model`);
+      }
+    }
+    // A profile field's expression may be anything the model file's could be:
+    // its own table's columns and its own entity's fields, never another
+    // entity's fields.
+    // A name after a dot is a struct path segment, such as `customer` in
+    // `details.customer.id`, and reads no entity.
+    const others = entities.map(x => x.name).filter(n => n !== pe.name);
+    for (const pf of pe.fields ?? []) {
+      for (const {text, dialect} of expressionSources(pf)) {
+        const columns = columnReferences(text, dialect);
+        if (!columns) {
+          unreadable.add(`field '${pe.name}.${pf.name}'`);
+          continue;
+        }
+        for (const other of others) {
+          if (fieldsReadOn(columns, other).length) {
+            errors.push(
+                `${at}: field '${pe.name}.${pf.name}' reads entity '${
+                    other}'; a field expression reads only its own entity`);
+          }
+        }
+        for (const ref of fieldsReadOn(columns, pe.name)) {
+          if (!known.has(ref)) {
+            errors.push(
+                `${at}: field '${pe.name}.${pf.name}' reads '${pe.name}.${
+                    ref}', which is not a field of '${pe.name}'`);
+          }
+        }
+      }
+    }
+  }
+  const relByName =
+      new Map((baseModel.relationships ?? []).map(r => [r.name, r]));
+  for (const pr of profile.relationships) {
+    if (!relByName.has(pr.name)) {
+      errors.push(`${at}: relationship '${pr.name}' is not in the model`);
+    }
+  }
+  const metricNames = new Set((baseModel.metrics ?? []).map(m => m.name));
+  if (Array.isArray(profile.metricsExclude)) {
+    for (const name of profile.metricsExclude) {
+      if (!metricNames.has(name)) {
+        errors.push(
+            `${at}: metric '${name}' in 'metrics_exclude' is not in the ` +
+            `model`);
+      }
+    }
+  }
+
+  // Every concrete entity bound, all in one database.
+  const databases = new Map<string, string>();
+  for (const e of entities) {
+    if (e.abstract) continue;
+    const pe = bindingOf.get(e.name);
+    if (!pe?.source) {
+      errors.push(`${at}: entity '${e.name}' has no source in this profile`);
+      continue;
+    }
+    const db = databaseOf(pe.source);
+    if (!db) {
+      errors.push(
+          `${at}: entity '${e.name}' source '${pe.source}' is not a resource ` +
+          `URI or a catalog name`);
+    } else if (!databases.has(db)) {
+      databases.set(db, e.name);
+    }
+  }
+  if (databases.size > 1) {
+    const named = [...databases.values()].map(n => `'${n}'`).join(', ');
+    errors.push(
+        `${at} binds entities in more than one database (${named}); a ` +
+        `profile reads from one system a single query can reach`);
+  }
+
+  // A profile's key columns are physical column names.
+  for (const pe of profile.entities) {
+    const keyColumns = [...(pe.primaryKey ?? []), ...(pe.uniqueKeys ?? []).flat()];
+    const bad = keyColumns.filter(c => !isColumnName(c));
+    if (bad.length) {
+      errors.push(
+          `${at}: entity '${pe.name}' key column ${
+              bad.map(c => `'${c}'`).join(', ')} is not a physical column ` +
+          `name`);
+    }
+  }
+
+  // Key shapes against the model file's, where it states keys.
+  for (const e of entities) {
+    const pe = bindingOf.get(e.name);
+    if (!pe || e.abstract) continue;
+    const inlineHasKey = e.keys.length > 0 || !!e.uniqueKeys?.length;
+    if (!inlineHasKey) continue;
+    if (pe.primaryKey !== undefined && pe.primaryKey.length !== e.keys.length) {
+      errors.push(
+          `${at}: entity '${e.name}' restates its primary key with ${
+              pe.primaryKey.length} column(s); the model file's has ${
+              e.keys.length}`);
+    }
+    if (pe.uniqueKeys !== undefined &&
+        shapeOf(pe.uniqueKeys) !== shapeOf(e.uniqueKeys ?? [])) {
+      errors.push(
+          `${at}: entity '${e.name}' restates its unique keys as ${
+              shapeOf(pe.uniqueKeys)}; the model file's are ${
+              shapeOf(e.uniqueKeys ?? [])}`);
+    }
+  }
+
+  // Every relationship bound, by the profile itself: a named profile states
+  // both join column lists, and the model file's do not stand in for them.
+  for (const r of baseModel.relationships ?? []) {
+    if (r.association) continue;
+    const pr = profile.relationships.find(x => x.name === r.name);
+    const from = pr?.fromColumns ?? [];
+    const to = pr?.toColumns ?? [];
+    if (!from.length || !to.length) {
+      errors.push(
+          `${at}: relationship '${r.name}' has no join columns in this ` +
+          `profile; a named profile states both 'from_columns' and ` +
+          `'to_columns' itself`);
+    } else if (from.length !== to.length) {
+      errors.push(
+          `${at}: relationship '${r.name}' joins ${from.length} column(s) to ${
+              to.length}`);
+    } else {
+      const bad = [...from, ...to].filter(c => !isColumnName(c));
+      if (bad.length) {
+        errors.push(
+            `${at}: relationship '${r.name}' join column ${
+                bad.map(c => `'${c}'`).join(', ')} is not a physical ` +
+            `column name`);
+      }
+    }
+  }
+
+  // Every field the model file leaves unbound is accounted for, and exclusions
+  // are closed under dependency. An exclusion applies to the entity that names
+  // it, not to that entity's descendants.
+  const excluded = new Set<string>();
+  for (const e of entities) {
+    if (e.abstract) continue;
+    const pe = bindingOf.get(e.name);
+    for (const name of pe?.fieldsExclude ?? []) {
+      excluded.add(`${e.name}.${name}`);
+    }
+    for (const f of seenOf.get(e.name)?.values() ?? []) {
+      if (!isFieldBound(f)) {
+        errors.push(
+            `${at}: field '${e.name}.${f.name}' has no binding in the model ` +
+            `file; bind it in 'fields' or leave it out in 'fields_exclude'`);
+      }
+    }
+  }
+  // Every bound field has a text this profile's database can run. The
+  // profile's dialect is the one its sources infer, checked once they all name
+  // one database.
+  const system = databases.size === 1 ?
+      [...databases.keys()][0].split('/')[0] :
+      undefined;
+  const dialect = system ? DIALECT_OF_SYSTEM[system] : undefined;
+  if (dialect) {
+    for (const e of entities) {
+      if (e.abstract) continue;
+      for (const f of seenOf.get(e.name)?.values() ?? []) {
+        if (isFieldBound(f) && !runsOn(f, dialect)) {
+          errors.push(
+              `${at}: field '${e.name}.${f.name}' has no expression for ${
+                  dialect} or ANSI_SQL, and this profile's sources are ${
+                  dialect}`);
+        }
+      }
+    }
+  }
+
+  // Each field that depends on an excluded one, and the excluded field it
+  // reaches.
+  const dangling = new Map<string, string>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const e of entities) {
+      if (e.abstract) continue;
+      for (const f of seenOf.get(e.name)?.values() ?? []) {
+        const key = `${e.name}.${f.name}`;
+        if (excluded.has(key) || dangling.has(key)) continue;
+        // A field reads only its own entity's fields. An
+        // inherited field is read in the form its declaring ancestor wrote it,
+        // because inheritance strips the qualifier when it copies one down.
+        for (const dep of fieldDependencies(
+                 profiled, e.name, f.name, unreadable)) {
+          const target = `${e.name}.${dep}`;
+          if (excluded.has(target) || dangling.has(target)) {
+            dangling.set(key, dangling.get(target) ?? target);
+            grew = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+  for (const [field, reached] of dangling) {
+    errors.push(
+        `${at}: field '${field}' depends on '${reached}', which this ` +
+        `profile excludes; exclude '${field}' too, or rebind it`);
+  }
+  const why = (target: string) => excluded.has(target) ?
+      'which this profile excludes' :
+      `which depends on '${dangling.get(target)}', an excluded field`;
+  if (profile.metricsExclude !== '*') {
+    const metricExcluded = new Set(profile.metricsExclude ?? []);
+    for (const m of baseModel.metrics ?? []) {
+      if (metricExcluded.has(m.name)) continue;
+      const read: SqlColumn[][] = [];
+      for (const {text, dialect} of expressionSources(m as Field)) {
+        const columns = columnReferences(text, dialect);
+        if (columns) {
+          read.push(columns);
+        } else {
+          unreadable.add(`metric '${m.name}'`);
+        }
+      }
+      const reached = [...excluded, ...dangling.keys()].filter(target => {
+        const [te, tf] = target.split('.');
+        return read.some(columns => fieldsReadOn(columns, te).includes(tf));
+      });
+      if (reached.length) {
+        errors.push(
+            `${at}: metric '${m.name}' reaches ${
+                reached.map(r => `'${r}', ${why(r)}`).join('; ')}; add '${
+                m.name}' to 'metrics_exclude'`);
+      }
+    }
+  }
+  for (const what of unreadable) {
+    warnings.push(
+        `${at}: kcmd could not read the SQL of ${what}, so the fields it ` +
+        `reads were not checked`);
+  }
+  return errors;
+}
+
+/**
+ * Returns one message per way `profiles` disagree with each other about the
+ * model, or an empty list:
+ *   - where the model file states no key for an entity, either every profile
+ *     states keys of one shape, or none does;
+ *   - in every binding that states a relationship's join columns, the model
+ *     file's included, its `to_columns` cover a primary or unique key of the
+ *     target, and the same keys in every binding, because cardinality is a
+ *     property of the model. A superset of a key
+ *     covers it (see keysCoveredBy).
+ */
+export function validateProfileConsistency(
+    baseModel: SemanticModel, profiles: ProfileSpec[]): string[] {
+  const errors: string[] = [];
+  const entities = baseModel.entities ?? [];
+  const bindingIn = (p: ProfileSpec, entity: string) =>
+      p.entities.find(e => e.name === entity);
+
+  for (const e of entities) {
+    if (e.abstract || e.keys.length || e.uniqueKeys?.length) continue;
+    const shapes = new Map<string, string[]>();
+    for (const p of profiles) {
+      const pe = bindingIn(p, e.name);
+      const shape = pe && (pe.primaryKey?.length || pe.uniqueKeys?.length) ?
+          `primary key of ${pe.primaryKey?.length ?? 0}, unique keys ${
+              shapeOf(pe.uniqueKeys ?? [])}` :
+          'no keys';
+      shapes.set(shape, [...(shapes.get(shape) ?? []), p.name]);
+    }
+    if (shapes.size > 1) {
+      const detail =
+          [...shapes].map(([s, ps]) => `${ps.join(', ')}: ${s}`).join('; ');
+      errors.push(
+          `entity '${e.name}' has no key in the model file, and its profiles ` +
+          `disagree on one (${detail}); every profile states keys of one ` +
+          `shape, or none does`);
+    }
+  }
+
+  const byName = new Map(entities.map(e => [e.name, e]));
+  // Each binding's fields, so a key or join column that names a field is read
+  // as that field's column, as the graph generators read it.
+  const baseFields = fieldsByEntity(baseModel);
+  const profileFields = new Map(
+      profiles.map(p => [p.name, fieldsByEntity(withProfile(baseModel, p))]));
+  for (const r of baseModel.relationships ?? []) {
+    if (r.association) continue;
+    const target = byName.get(r.destination.entity);
+    if (!target || target.abstract) continue;
+    // Every binding that binds the relationship, by stating its join columns,
+    // covers a key of the target, and the same keys as every other binding,
+    // because cardinality is a property of the model. A binding's keys are its
+    // own where it states them and the model file's otherwise. A join that
+    // covers no key is neither many-to-one nor one-to-one, so it is rejected. A binding
+    // that states no join columns does not bind the relationship and is left
+    // out; for a named profile, completeness reports that.
+    const answers = new Map<string, string[]>();
+    const record =
+        (who: string, fields: Map<string, Map<string, Field>>, to: string[],
+         pk: string[], uks: string[][]) => {
+          if (!to.length) return;
+          const entity = {
+            name: target.name,
+            fields: [...(fields.get(target.name)?.values() ?? [])],
+          };
+          const covered = keysCoveredByColumns(entity, to, pk, uks);
+          // A key that names a field with no column in this binding cannot be
+          // judged here.
+          if (!covered) return;
+          if (!covered.length) {
+            errors.push(
+                `relationship '${r.name}': ${who} joins on to_columns ${
+                    JSON.stringify(to)}, which cover no primary or unique key ` +
+                `of '${target.name}'`);
+            return;
+          }
+          const a = covered.join(' and ');
+          answers.set(a, [...(answers.get(a) ?? []), who]);
+        };
+    record(
+        'the model file', baseFields, r.destination.columns, target.keys,
+        target.uniqueKeys ?? []);
+    for (const p of profiles) {
+      const pr = p.relationships.find(x => x.name === r.name);
+      const pe = bindingIn(p, target.name);
+      record(
+          `profile '${p.name}'`, profileFields.get(p.name)!,
+          pr?.toColumns ?? [],
+          pe?.primaryKey ?? target.keys,
+          pe?.uniqueKeys ?? target.uniqueKeys ?? []);
+    }
+    if (answers.size > 1) {
+      const detail =
+          [...answers].map(([a, who]) => `${who.join(', ')}: ${a}`).join('; ');
+      errors.push(
+          `relationship '${r.name}' covers different keys under different ` +
+          `bindings (${detail}); its 'to_columns' must cover the same keys in ` +
+          `every binding`);
+    }
+  }
+  return errors;
+}
+
+// Each entity's fields, declared plus inherited, by name. Resolution throws on a
+// broken hierarchy, which push reports elsewhere; this then falls back to
+// declared fields.
+function fieldsByEntity(model: SemanticModel): Map<string, Map<string, Field>> {
+  let resolved: Entity[] = model.entities ?? [];
+  if (resolved.some(e => e.extends?.length)) {
+    try {
+      resolved = resolveInheritance(model).model.entities ?? resolved;
+    } catch {
+      // keep the declared fields
+    }
+  }
+  // Resolution already leaves excluded fields off; this covers a model with no
+  // inheritance, which is not resolved, and a broken one.
+  return new Map(resolved.map(e => {
+    const excluded = new Set(e.excludedFields ?? []);
+    return [
+      e.name,
+      new Map(e.fields.filter(f => !excluded.has(f.name)).map(f => [f.name, f])),
+    ];
+  }));
+}
+
+// The model as `profile` sees it: each field the profile binds takes that
+// binding, as a binding-only redeclaration when the entity only inherits it,
+// and each field the profile excludes is marked excluded on the entity that
+// names it, which leaves it off that entity and nowhere else. This is what
+// merging the profile and applyProfileExclusions do to the model.
+function withProfile(model: SemanticModel, profile: ProfileSpec): SemanticModel {
+  const out = structuredClone(model);
+  const bindingOf = new Map(profile.entities.map(pe => [pe.name, pe]));
+  for (const e of out.entities ?? []) {
+    const pe = bindingOf.get(e.name);
+    if (!pe || e.abstract) continue;
+    for (const pf of pe.fields ?? []) {
+      if (!isFieldBound(pf)) continue;
+      const binding: Partial<Field> = {};
+      for (const k of FIELD_BINDING_KEYS) {
+        if (pf[k] !== undefined) (binding as any)[k] = pf[k];
+      }
+      const own = e.fields.find(f => f.name === pf.name);
+      if (own) {
+        for (const k of FIELD_BINDING_KEYS) delete own[k];
+        Object.assign(own, binding);
+      } else {
+        e.fields.push({name: pf.name, ...binding});
+      }
+    }
+    if (pe.fieldsExclude?.length) {
+      e.excludedFields = [...new Set(pe.fieldsExclude)];
+    }
+  }
+  return out;
+}
+
+// The message of the inheritance error resolving `model` throws, or undefined
+// when it resolves.
+function inheritanceErrorOf(model: SemanticModel): string|undefined {
+  if (!(model.entities ?? []).some(e => e.extends?.length)) return undefined;
+  try {
+    resolveInheritance(model);
+    return undefined;
+  } catch (err: any) {
+    return err?.message ?? String(err);
+  }
+}
+
+// The fields of its own entity that `field` reads on `entityName`, from the
+// expression as written: the entity's own declaration when it binds the field,
+// otherwise that of the nearest ancestor that does, read with that ancestor's
+// qualifier.
+function fieldDependencies(
+    model: SemanticModel, entityName: string, field: string,
+    unreadable: Set<string>): string[] {
+  const byName = new Map((model.entities ?? []).map(e => [e.name, e]));
+  const queue = [entityName];
+  const seen = new Set<string>();
+  while (queue.length) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const e = byName.get(name);
+    const own = e?.fields.find(f => f.name === field && isFieldBound(f));
+    if (own) {
+      const deps = new Set<string>();
+      for (const {text, dialect} of expressionSources(own)) {
+        const columns = columnReferences(text, dialect);
+        if (!columns) {
+          unreadable.add(`field '${name}.${field}'`);
+          continue;
+        }
+        for (const dep of fieldsReadOn(columns, name)) deps.add(dep);
+      }
+      return [...deps];
+    }
+    queue.push(...(e?.extends ?? []));
+  }
+  return [];
+}
+
+// "[2, 1]": how many unique keys, and how wide each is.
+function shapeOf(keys: string[][]): string {
+  return `[${keys.map(k => k.length).join(', ')}]`;
+}
+

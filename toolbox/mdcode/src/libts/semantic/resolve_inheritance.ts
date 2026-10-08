@@ -111,9 +111,9 @@ export function declaredConceptFields(model: SemanticModel):
 /**
  * Returns a clone of `model` with every entity's `extends` expanded to its full
  * transitive ancestor set and its `fields` flattened to include inherited
- * fields. The input is never mutated. An entity with no `extends` is returned
- * byte-for-byte unchanged (same fields, no `extends`), so a model with no
- * inheritance resolves to an equivalent model.
+ * fields, less any a profile excludes on that entity. The input is never
+ * mutated. An entity with no `extends` keeps its own fields, so a model with no
+ * inheritance and no exclusions resolves to an equivalent model.
  */
 export function resolveInheritance(model: SemanticModel): ResolveResult {
   const clone: SemanticModel = structuredClone(model);
@@ -182,7 +182,13 @@ export function resolveInheritance(model: SemanticModel): ResolveResult {
       seenField.add(name);
       flattened.push(mergeChain(name, chain, ownFields, ancestorsOf));
     }
-    entity.fields = flattened;
+    // A field the binding profile excludes on this entity is left off it.
+    // Descendants read the snapshot of declared fields, so they still inherit
+    // it.
+    const excluded = new Set(entity.excludedFields ?? []);
+    entity.fields = excluded.size ?
+        flattened.filter(f => !excluded.has(f.name)) :
+        flattened;
 
     // Expand `extends` to the resolved ancestor list. Drop the key when the
     // entity has no parents, so a consumer reads `extends` as the exact label

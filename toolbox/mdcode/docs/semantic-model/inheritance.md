@@ -115,13 +115,11 @@ of its definition come from `Party`, and push rejects a redeclaration that
 restates them.
 
 To bind the same hierarchy to more than one store, put each binding in its own
-[profile](profiles.md). A profile answers the supertype query only for the
-subtypes it binds: bind `Customer` but leave `Supplier` unbound and
-`MATCH (:Party)` returns customers alone. A profile binds only fields its entity
-declares in the model file. To bind an inherited field from a profile,
-redeclare it on the subtype by name alone, as in `- { name: name }`. The
-redeclaration changes nothing in the model and gives the profile a field to
-bind.
+[profile](profiles.md). A named profile binds every concrete subtype, since
+each one stands for a table the profile's database has to hold. A profile can
+bind a field the
+subtype inherits by naming it under that subtype, with no redeclaration in the
+model file, and the binding reads from the subtype's own table.
 
 ## 3. Query the supertype
 
@@ -350,7 +348,7 @@ so a subtype's table must have a column for every inherited field, or the deploy
 fails. Push also rejects a model that breaks any of these rules:
 
 - A subtype redeclares an inherited field only to bind it to a column. A
-  redeclaration with nothing but the name is allowed and changes nothing.
+  redeclaration with nothing but the name is rejected.
 - An abstract entity declares no `source`, no keys and no field expressions.
 - Relationships and metrics attach only to concrete leaf entities.
 - No field is declared or rebound by two supertypes that do not extend each

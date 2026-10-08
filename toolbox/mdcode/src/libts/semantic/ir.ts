@@ -87,6 +87,10 @@ export interface SemanticModel {
   profiles?: ProfileSpec[];
   // Named targets from `deployments:`, each naming the profile it deploys.
   deployments?: DeploymentSpec[];
+  // Metrics the binding profile in use names in `metrics_exclude`. They stay
+  // in `metrics`, so a catalog push still publishes them; pruning drops them.
+  // Set when a profile is applied; absent otherwise.
+  excludedMetrics?: string[];
 }
 
 /**
@@ -137,6 +141,13 @@ export interface Entity {
   aiContext?: AiContext;
   fields: Field[];       // dimensions / attributes
   customExtensions?: CustomExtension[];
+  // Fields this entity does not expose under the binding profile in use:
+  // the ones the profile names in `fields_exclude`, and
+  // declarations kept only for descendants that inherit them. Inheritance
+  // resolution leaves them off this entity, declared or inherited, and its
+  // descendants still inherit the declarations, because a binding is a fact
+  // about one table. Set when a profile is applied; absent otherwise.
+  excludedFields?: string[];
 }
 
 /**
@@ -317,6 +328,29 @@ void everyFieldKeyListed;
 export function isFieldBound(
     field: Pick<Field, 'expression'|'importedExpression'>): boolean {
   return fieldBinding(field) !== undefined;
+}
+
+/**
+ * The keys a relationship's `to_columns` cover, as "the primary key" and
+ * "unique key k" (from 1), in that order. A key is covered when every one of
+ * its columns is among `to_columns`, so a superset of a key covers it, since
+ * each row still matches at most one target row. An empty result means the
+ * join reaches no key. Column names compare as BigQuery compares them: ignoring
+ * case, and without the backticks that only quote a name.
+ */
+export function keysCoveredBy(
+    toColumns: string[], primaryKey: string[], uniqueKeys: string[][]):
+    string[] {
+  const columnKey = (c: string) => c.replace(/^`(.*)`$/, '$1').toLowerCase();
+  const has = new Set(toColumns.map(columnKey));
+  const covers = (key: string[]) =>
+      key.length > 0 && key.every(c => has.has(columnKey(c)));
+  const out: string[] = [];
+  if (covers(primaryKey)) out.push('the primary key');
+  uniqueKeys.forEach((key, i) => {
+    if (covers(key)) out.push(`unique key ${i + 1}`);
+  });
+  return out;
 }
 
 /**
@@ -814,7 +848,10 @@ export interface ProfileEntityBinding {
   source?: string;          // as the profile wrote it
   primaryKey?: string[];    // physical column names
   uniqueKeys?: string[][];
-  fields?: Array<Pick<Field, 'name'|'expression'|'dialects'|'stringForm'>>;
+  fields?: Array<Pick<
+      Field,
+      'name'|'expression'|'dialects'|'stringForm'|'importedExpression'|
+      'importedDialect'>>;
   fieldsExclude?: string[]; // fields this profile deliberately leaves unbound
 }
 

@@ -8,6 +8,9 @@
 // placement / qualifier stripping) share this one implementation.
 //
 
+import {Entity, fieldBinding, keysCoveredBy} from './ir';
+import {SqlColumn, sqlColumns} from './sql_parser';
+
 // Matches a single- or double-quoted SQL string literal, honoring backslash
 // escapes. (Triple-quoted / raw literals are uncommon in these expressions and
 // are treated as ordinary text.)
@@ -69,4 +72,67 @@ export function referencedEntityNames(
 export function stripQualifier(expression: string, entity: string): string {
   const re = entityQualifier(entity, 'g');
   return mapOutsideStringLiterals(expression, seg => seg.replace(re, ''));
+}
+
+// The physical column a key or join column names, as the graph generators read
+// it: a name that matches one of the entity's fields is that field's column,
+// and any other name is a column already. Undefined when the name is a field
+// with no column in this binding.
+export function keyColumn(
+    entity: Pick<Entity, 'name'|'fields'>, name: string): string|undefined {
+  const field = entity.fields.find(f => f.name === name);
+  if (!field) return name;
+  const expr = fieldBinding(field);
+  return expr === undefined ? undefined : stripQualifier(expr, entity.name).trim();
+}
+
+// Which keys `toColumns` cover once every name is read as its column (see
+// keysCoveredBy), or undefined when that cannot be told yet: a join column or
+// a key column names a field with no column in this binding.
+export function keysCoveredByColumns(
+    entity: Pick<Entity, 'name'|'fields'>, toColumns: string[],
+    primaryKey: string[], uniqueKeys: string[][]): string[]|undefined {
+  const col = (name: string) => keyColumn(entity, name);
+  const to = toColumns.map(col);
+  if (to.some(c => c === undefined)) return undefined;
+  const keys = [primaryKey, ...uniqueKeys].map(k => k.map(col));
+  if (keys.some(k => k.some(c => c === undefined))) return undefined;
+  return keysCoveredBy(
+      to as string[], keys[0] as string[], keys.slice(1) as string[][]);
+}
+
+// Every column an expression reads, with the qualifier written before it, in
+// the order written, or undefined when the SQL parser cannot read the
+// expression in `dialect`, one of the dialect names a dialect list uses. The
+// parser handles string literals, comments and each dialect's quoting, so
+// `"orders"."amount"` in a PostgreSQL text reads the column `amount` of
+// `orders`, while in BigQuery the same text is not SQL and gives undefined. A struct path reads
+// as its first two parts: `orders.shipping_address.city` reads
+// `shipping_address` of `orders`.
+export function columnReferences(expression: string, dialect: string):
+    SqlColumn[]|undefined {
+  return sqlColumns(expression, dialect);
+}
+
+// The fields `columns` read on `entityName`, written `entityName.field`,
+// deduplicated in first-seen order. Matching is case-sensitive.
+export function fieldsReadOn(columns: SqlColumn[], entityName: string):
+    string[] {
+  const fields: string[] = [];
+  for (const c of columns) {
+    if (c.qualifier === entityName && !fields.includes(c.name)) {
+      fields.push(c.name);
+    }
+  }
+  return fields;
+}
+
+// Whether a key or join column is a physical column name rather than an
+// expression. A value that starts and ends with a backtick, with none between,
+// passes whatever it holds. An unquoted value may not contain whitespace,
+// parentheses, a dot, a comma, a backtick or a SQL operator. Nothing else about
+// the character set is checked; the database rejects a bad name.
+export function isColumnName(value: unknown): boolean {
+  return typeof value === 'string' &&
+      (/^`[^`]+`$/.test(value) || /^[^\s().+\-*/%=<>!|&^~,`]+$/.test(value));
 }
